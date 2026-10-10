@@ -129,6 +129,9 @@ class Wallet:
         self.events: queue.Queue = queue.Queue()
         self.session_earned = 0
         self.session_jobs = 0
+        self.net_cache = {"bal": None, "left": None, "jobs": [], "txs": []}
+        self._fetching = False
+        self._last_fetch = 0.0
 
         # header ------------------------------------------------------
         hdr = ttk.Frame(root, padding=(10, 8, 10, 0))
@@ -315,16 +318,8 @@ class Wallet:
         if not messagebox.askyesno("Confirm send", f"Send {fmt_watts(amount)} to\n{to}?"):
             return
         if self.gw:
-            try:
-                self.ensure_registered()
-                pkg = pq.sign(self.key["seed"], self.gw_ots(frm), frm, to, amount)
-                tx = {"type": "transfer", "from": frm, "to": to, "amount": amount, "sig": pkg}
-                r = self.gw_rpc({"op": "submit_tx", "tx": tx})
-                self.say(f"Network send: {r.get('msg', r)} (confirms in next block).",
-                         "good" if r.get("ok") else "bad")
-            except (ValueError, OSError) as e:
-                self.say(f"Send failed: {e}", "bad")
-            self.refresh()
+            self.say("Submitting transfer…")
+            threading.Thread(target=self._net_send, args=(frm, to, amount), daemon=True).start()
             return
         try:
             pkg = pq.sign(self.key["seed"], next_ots(self.conn, frm), frm, to, amount)
@@ -339,6 +334,16 @@ class Wallet:
         except (ValueError, sqlite3.Error) as e:
             self.say(f"Send failed: {e}", "bad")
         self.refresh()
+
+    def _net_send(self, frm: str, to: str, amount: int):
+        try:
+            self.ensure_registered()
+            pkg = pq.sign(self.key["seed"], self.gw_ots(frm), frm, to, amount)
+            tx = {"type": "transfer", "from": frm, "to": to, "amount": amount, "sig": pkg}
+            r = self.gw_rpc({"op": "submit_tx", "tx": tx})
+            self.events.put(("info", f"Network send: {r.get('msg', r)} (confirms in next block)."))
+        except (ValueError, ConnectionError, OSError, KeyError) as e:
+            self.events.put(("info", f"Send failed: {e}"))
 
     def amount_hint(self):
         try:
@@ -356,19 +361,13 @@ class Wallet:
         if self.mining.is_set():
             return
         if self.gw:
-            try:
-                cl, kind = self.net_miner()
-            except (AssertionError, ConnectionError, ValueError, OSError) as e:
-                self.say(f"Gateway connect failed: {e}", "bad")
-                return
-            self.ensure_registered()
             self.mining.set()
-            threading.Thread(target=self.net_loop, args=(cl,), daemon=True).start()
+            threading.Thread(target=self._net_connect_loop, daemon=True).start()
             self.mine_btn.configure(text="⏸ Stop mining")
             self.spin.grid(row=0, column=6, padx=4)
             self.spin.start(30)
-            self.status.set(f"mining {self._mode} ({kind})")
-            self.say(f"Mining {self._mode} ({kind}).")
+            self.status.set(f"connecting {self._mode}…")
+            self.say(f"Connecting {self._mode}…")
             return
         m = self.miner()
         if m is None:
@@ -385,6 +384,20 @@ class Wallet:
     def stop(self):
         self.mining.clear()
         self.say("Miner stopping…")
+
+    def _net_connect_loop(self):
+        try:
+            cl, kind = self.net_miner()
+        except (AssertionError, ConnectionError, ValueError, OSError) as e:
+            self.events.put(("info", f"Gateway connect failed: {e}"))
+            self.mining.clear()
+            return
+        try:
+            self.ensure_registered()
+        except (ConnectionError, OSError, ValueError, KeyError):
+            pass
+        self.events.put(("info", f"Mining {self._mode} ({kind})."))
+        self.net_loop(cl)
 
     def show_board(self):
         self.say("--- leaderboard ---")
@@ -492,8 +505,40 @@ class Wallet:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def kick_fetch(self):
+        """Background sync: all gateway RPC off the UI thread. Results land
+        in net_cache via events; widgets only ever read the cache."""
+        import time as _t
+        if self._fetching or _t.time() - self._last_fetch < 3.0:
+            return
+        self._fetching = True
+        mid = self.mid.get().strip()
+        def run():
+            try:
+                bal = int(self.gw_rpc({"op": "balance", "addr": mid}, timeout=12)["balance_watts"])
+                try:
+                    left = pq.NKEYS - int(self.gw_rpc({"op": "next_ots", "miner_id": mid}, timeout=12)["ots"])
+                except (ConnectionError, OSError, ValueError, KeyError):
+                    left = None
+                try:
+                    hist = self.gw_rpc({"op": "history", "addr": mid, "limit": 30}, timeout=12)
+                except (ConnectionError, OSError, ValueError, KeyError):
+                    hist = {}
+                self.events.put(("netdata", {"bal": bal, "left": left,
+                                             "jobs": hist.get("jobs", []),
+                                             "txs": hist.get("transfers", [])}))
+            except (ConnectionError, OSError, ValueError, KeyError):
+                self.events.put(("netdata", None))
+            finally:
+                self._fetching = False
+                import time as _t2
+                self._last_fetch = _t2.time()
+        threading.Thread(target=run, daemon=True).start()
+
     def poll(self):
-        if not self.gw:
+        if self.gw:
+            self.kick_fetch()  # network I/O never runs on the UI thread
+        else:
             try:
                 import gossip
                 n = gossip.collect(self.conn, {self.mid.get().strip(), self.key["addr"]})
@@ -504,6 +549,15 @@ class Wallet:
         try:
             while True:
                 kind, msg = self.events.get_nowait()
+                if kind == "netdata":
+                    if msg is not None:
+                        self.net_cache.update(msg)
+                        self.status.set(f"{self._mode} — synced")
+                    else:
+                        self.status.set(f"{self._mode} — unreachable")
+                    self.refresh_tabs()
+                    self.refresh()
+                    continue
                 self.say(msg, "good" if kind == "job" and "pass=1" in msg
                          else "bad" if "pass=0" in msg or "fail" in msg.lower() or "error" in msg.lower()
                          else None)
@@ -520,14 +574,10 @@ class Wallet:
             for i in tv.get_children():
                 tv.delete(i)
         if self.gw:
-            try:
-                r = self.gw_rpc({"op": "history", "addr": mid, "limit": 30})
-            except (ConnectionError, OSError, ValueError):
-                return
-            for jid, passed, pay in sorted(r.get("jobs", []), reverse=True)[:30]:
+            for jid, passed, pay in sorted(self.net_cache["jobs"], reverse=True)[:30]:
                 self.jobs_tv.insert("", "end", values=(f"#{jid}", "pass" if passed else "fail",
                                                       fmt_watts(pay or 0), ""))
-            for frm, to, amt in r.get("transfers", [])[:30]:
+            for frm, to, amt in self.net_cache["txs"][:30]:
                 d = "in" if to == mid else "out"
                 peer = frm if d == "in" else to
                 self.tx_tv.insert("", "end", values=(d, (peer or "")[:34], fmt_watts(amt)))
@@ -550,18 +600,9 @@ class Wallet:
     def refresh(self):
         try:
             if self.gw:
-                try:
-                    b = int(self.gw_rpc({"op": "balance", "addr": self.mid.get().strip()})["balance_watts"])
-                except (ConnectionError, OSError, ValueError, KeyError):
-                    b = None
+                b, left = self.net_cache["bal"], self.net_cache["left"]
                 if b is None:
-                    self.status.set(f"{self._mode} — unreachable")
-                    return
-                left = "?"
-                try:
-                    left = pq.NKEYS - self.gw_ots(self.mid.get().strip())
-                except (ConnectionError, OSError, ValueError, KeyError):
-                    pass
+                    return  # no sync yet; netdata event will fill cache
                 self.bal.set(f"{fmt_watts(b)}")
                 self.ots_txt.set(f"{left}/{pq.NKEYS} left" if isinstance(left, int) else "sigs: ?")
                 if isinstance(left, int):
