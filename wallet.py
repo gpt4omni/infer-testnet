@@ -255,15 +255,20 @@ class Wallet:
             return LlamaCppBackend(), "gemma-4-12B-Q4", 0.05
         return MockBackend("good"), "mock-7b", 0.02
 
-    def net_miner(self):
-        mid = self.mid.get().strip() or self.key["addr"]
-        be, model, price = self._backend()
+    def net_miner(self, mid: str, backend_kind: str):
+        be, model, price = self._backend_kind(backend_kind)
         if self.gw.get("tls"):
             from net import WANMiner
             return WANMiner(self.key, be, self.gw["host"], self.gw["port"], self.gw["pin"],
                             model, price), "wan"
         from net import MinerClient
         return MinerClient(mid, be, self.gw["host"], self.gw["port"], model, price), "plain"
+
+    def _backend_kind(self, kind: str):
+        if kind == "gpu" and gpu_alive():
+            from miner import LlamaCppBackend
+            return LlamaCppBackend(), "gemma-4-12B-Q4", 0.05
+        return MockBackend("good"), "mock-7b", 0.02
 
     # -- actions (main thread) -------------------------------------------
     def miner(self):
@@ -362,7 +367,9 @@ class Wallet:
             return
         if self.gw:
             self.mining.set()
-            threading.Thread(target=self._net_connect_loop, daemon=True).start()
+            mid = self.mid.get().strip() or self.key["addr"]
+            kind = BACKENDS[self.backend.get()]
+            threading.Thread(target=self._net_connect_loop, args=(mid, kind), daemon=True).start()
             self.mine_btn.configure(text="⏸ Stop mining")
             self.spin.grid(row=0, column=6, padx=4)
             self.spin.start(30)
@@ -385,9 +392,9 @@ class Wallet:
         self.mining.clear()
         self.say("Miner stopping…")
 
-    def _net_connect_loop(self):
+    def _net_connect_loop(self, mid: str, backend_kind: str):
         try:
-            cl, kind = self.net_miner()
+            cl, kind = self.net_miner(mid, backend_kind)
         except (AssertionError, ConnectionError, ValueError, OSError) as e:
             self.events.put(("info", f"Gateway connect failed: {e}"))
             self.mining.clear()
