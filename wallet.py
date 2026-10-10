@@ -289,9 +289,10 @@ class Wallet:
         if self.gw.get("tls"):
             from net import WANMiner
             return WANMiner(self.key, be, self.gw["host"], self.gw["port"], self.gw["pin"],
-                            model, price), "wan"
+                            model, price, infer=True), "wan"
         from net import MinerClient
-        return MinerClient(mid, be, self.gw["host"], self.gw["port"], model, price), "plain"
+        return MinerClient(mid, be, self.gw["host"], self.gw["port"], model, price,
+                           infer=True), "plain"
 
     def _backend_kind(self, kind: str):
         if kind == "tiny" and gpu_alive():
@@ -603,7 +604,7 @@ class Wallet:
         try:
             while self.mining.is_set():
                 try:
-                    task, res = cl.run_job()
+                    kind, what, res = cl.run_mixed_once()
                 except (ConnectionError, OSError, ValueError) as e:
                     self.events.put(("job", f"net error: {e}"))
                     break
@@ -613,8 +614,11 @@ class Wallet:
                 self.session_jobs += 1
                 pay = res.get("payout_watts", 0)
                 self.session_earned += pay
+                if kind == "infer":
+                    self.events.put(("job", f"job {self.session_jobs}: served inference {what}"))
+                    continue
                 conf = "" if res.get("confirmed", True) else " (unconfirmed)"
-                self.events.put(("job", f"job {self.session_jobs}: {task} pass={int(res.get('passed', 0))} "
+                self.events.put(("job", f"job {self.session_jobs}: {what} pass={int(res.get('passed', 0))} "
                                  f"+{fmt_watts(pay)}{conf}"))
         finally:
             try:
