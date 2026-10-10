@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(__file__))
 
 
@@ -134,6 +135,10 @@ def main():
         while a.jobs == 0 or n < a.jobs:
             task, res = run()
             if res.get("ok") is False:
+                if "rate limited" in str(res.get("msg", "")):
+                    print("throttled — backing off 10s…", flush=True)
+                    time.sleep(10)
+                    continue
                 print(f"REJECTED: {res}", flush=True)
                 break
             earned += res.get("payout_watts", 0)
