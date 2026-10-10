@@ -222,6 +222,26 @@ class Wallet:
             self.tx_tv.heading(c_, text=c_.title())
             self.tx_tv.column(c_, width=w_)
         nb.add(self.tx_tv, text="Transfers")
+        pg = ttk.Frame(nb, padding=8)
+        nb.add(pg, text="Playground")
+        pg.columnconfigure(0, weight=1)
+        ttk.Label(pg, text="Ask anything — served by network miners, scored by d1.").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        self.pg_prompt = tk.Text(pg, height=4, width=60, wrap="word", font=("", 10))
+        self.pg_prompt.grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        btnrow = ttk.Frame(pg)
+        btnrow.grid(row=2, column=0, columnspan=2, sticky="w")
+        self.pg_ask_btn = ttk.Button(btnrow, text="Ask", command=self.ask_pg)
+        self.pg_ask_btn.pack(side="left")
+        self.pg_pay_btn = ttk.Button(btnrow, text="Accept & pay", command=self.pay_pg, state="disabled")
+        self.pg_pay_btn.pack(side="left", padx=6)
+        self.pg_meta = tk.StringVar(value="")
+        ttk.Label(btnrow, textvariable=self.pg_meta, font=("", 9)).pack(side="left", padx=6)
+        self.pg_answer = tk.Text(pg, height=10, width=60, wrap="word", state="disabled",
+                                 font=("TkFixedFont", 9))
+        self.pg_answer.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=4)
+        pg.rowconfigure(3, weight=1)
+        self.pg_job = None  # {job_id, miner, quote, output, score}
         root.rowconfigure(4, weight=1)
 
         # status bar -------------------------------------------------------
@@ -470,6 +490,85 @@ class Wallet:
         t.insert("end", self.key["seed"])
         t.configure(state="disabled")
 
+    # -- inference playground ----------------------------------------------
+    def pg_show(self, text, meta=""):
+        self.pg_answer.configure(state="normal")
+        self.pg_answer.delete("1.0", "end")
+        self.pg_answer.insert("end", text)
+        self.pg_answer.configure(state="disabled")
+        self.pg_meta.set(meta)
+
+    def ask_pg(self):
+        prompt = self.pg_prompt.get("1.0", "end").strip()
+        if not prompt:
+            self.pg_show("", "type a prompt first")
+            return
+        self.pg_ask_btn.configure(state="disabled")
+        self.pg_pay_btn.configure(state="disabled")
+        self.pg_job = None
+        self.pg_show("working…", "contacting miners")
+        mid = self.mid.get().strip()
+        if self.gw:
+            threading.Thread(target=self._pg_run, args=(prompt, mid), daemon=True).start()
+        else:
+            m = self.miner()
+            threading.Thread(target=self._pg_run_local,
+                             args=(prompt, m.backend, m.model), daemon=True).start()
+
+    def _pg_run(self, prompt, mid):
+        try:
+            r = self.gw_rpc({"op": "infer_submit", "prompt": prompt, "max_tokens": 128,
+                             "customer": mid})
+            if not r.get("ok"):
+                self.events.put(("pgfail", f"rejected: {r}"))
+                return
+            jid, quote = r["job_id"], r["quoted_watts"]
+            import time as _t
+            out, miner = None, ""
+            for _ in range(40):
+                _t.sleep(3)
+                res = self.gw_rpc({"op": "infer_result", "job_id": jid}, timeout=15)
+                if res.get("ok"):
+                    out, miner = res.get("output", ""), res.get("miner", "")
+                    break
+            if out is None:
+                self.events.put(("pgfail", "no miner served it in time"))
+                return
+            score = self._pg_score(prompt, out)
+            self.pg_job = {"miner": miner, "quote": quote, "output": out}
+            meta = f"by {miner[:16]}… quoted {quote} watts" + (f" d1={score:.2f}" if score is not None else "")
+            self.events.put(("pg", (out, meta)))
+        except (ConnectionError, OSError, ValueError, KeyError) as e:
+            self.events.put(("pgfail", f"error: {e}"))
+
+    def _pg_run_local(self, prompt, backend, model):
+        try:
+            out, lat = backend.generate_raw(prompt, 128)
+            score = self._pg_score(prompt, out)
+            self.pg_job = {"miner": "local", "quote": 0, "output": out}
+            meta = f"local {model} ({lat:.0f}ms)" + (f" d1={score:.2f}" if score is not None else " d1=n/a")
+            self.events.put(("pg", (out, meta)))
+        except (ConnectionError, OSError, ValueError, KeyError) as e:
+            self.events.put(("pgfail", f"error: {e}"))
+
+    @staticmethod
+    def _pg_score(prompt, out):
+        try:
+            from judge import DJudge
+            return DJudge(timeout=30).quality(prompt, out)
+        except Exception:
+            return None
+
+    def pay_pg(self):
+        if not self.pg_job or not self.gw:
+            self.pg_show(self.pg_answer.get("1.0", "end").strip(),
+                         "nothing to pay (local mode is free)")
+            return
+        to, amount = self.pg_job["miner"], self.pg_job["quote"]
+        self.to_id.set(to)
+        self.amount.set(str(amount))
+        self.send()
+
     # -- mining loop (worker thread; DB via own connection) ----------------
     def loop(self, miner):
         conn = connect(self.db_path)
@@ -569,6 +668,19 @@ class Wallet:
                     else:
                         self.status.set(f"{self._mode} — unreachable")
                     self.refresh_tabs()
+                    self.refresh()
+                    continue
+                if kind == "pg":
+                    out, meta = msg
+                    self.pg_show(out, meta)
+                    self.pg_ask_btn.configure(state="normal")
+                    if self.pg_job and self.gw:
+                        self.pg_pay_btn.configure(state="normal")
+                    self.refresh()
+                    continue
+                if kind == "pgfail":
+                    self.pg_show("", str(msg))
+                    self.pg_ask_btn.configure(state="normal")
                     self.refresh()
                     continue
                 self.say(msg, "good" if kind == "job" and "pass=1" in msg
