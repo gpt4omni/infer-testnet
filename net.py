@@ -350,7 +350,8 @@ class GatewayServer:
             txs = [{"type": "mint", "from": "subsidy", "to": self.reward_addr,
                     "amount": self.block_reward}] + txs
         if not tip:
-            blk = mine_block("00" * 32, 0, self.bits, [])  # genesis carries no user txs
+            txs, n_mem = [], 0  # genesis carries no user txs (consensus rule)
+            blk = mine_block("00" * 32, 0, self.bits, txs)
         else:
             with self.lock:
                 bits = retarget(self.chain.path_to(tip)) or self.bits
