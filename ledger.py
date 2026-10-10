@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """SQLite ledger: jobs, miners, payouts. Auditable, no chain needed for v0."""
+import os
 import sqlite3
+import sys
 import time
+
+
+def app_state_dir() -> str:
+    """Writable per-user state dir. Frozen bundles (AppImage/exe) run from
+    read-only mounts, so state NEVER lives next to the code there."""
+    if getattr(sys, "frozen", False):
+        d = os.path.join(os.path.expanduser("~"), ".local", "share", "infer-wallet")
+    else:
+        d = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(d, exist_ok=True)
+    return d
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS miners(

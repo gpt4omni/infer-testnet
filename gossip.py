@@ -9,7 +9,9 @@ pins roots via pq_accounts from chain history instead.
 import json
 import os
 
-OUTBOX = os.path.join(os.path.dirname(__file__), "outbox")
+from ledger import app_state_dir
+
+OUTBOX = os.path.join(app_state_dir(), "outbox")
 
 
 def broadcast(from_addr: str, root_hex: str, to_addr: str, amount: int, sig_pkg: dict):

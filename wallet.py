@@ -30,8 +30,10 @@ GPU_URL = "http://127.0.0.1:19091/health"
 
 
 def paths(profile: str):
-    """Separate DB + key per profile so two wallets never share state."""
-    base = os.path.dirname(__file__)
+    """Separate DB + key per profile so two wallets never share state.
+    Frozen builds use ~/.local/share/infer-wallet (bundle is read-only)."""
+    from ledger import app_state_dir
+    base = app_state_dir() if getattr(sys, "frozen", False) else os.path.dirname(__file__)
     if profile in ("", "default"):
         return os.path.join(base, "wallet.db"), os.path.join(base, "wallet-pq.json")
     return (os.path.join(base, f"wallet-{profile}.db"),
@@ -445,7 +447,7 @@ class Wallet:
             if bal > 0:
                 pkg = pq.sign(old["seed"], next_ots(self.conn, old["addr"]), old["addr"], new["addr"], bal)
                 transfer(self.conn, old["addr"], new["addr"], bal, pkg)
-            arch = os.path.join(os.path.dirname(__file__), f"wallet-pq.old-{old['addr'][:10]}.json")
+            arch = os.path.join(os.path.dirname(self.db_path), f"wallet-pq.old-{old['addr'][:10]}.json")
             with open(arch, "w") as f:
                 json.dump(old, f)
             os.chmod(arch, 0o600)
