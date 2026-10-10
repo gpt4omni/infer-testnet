@@ -133,7 +133,12 @@ def main():
         run = cl.run_job
     try:
         while a.jobs == 0 or n < a.jobs:
-            task, res = run()
+            try:
+                task, res = run()
+            except (ConnectionError, OSError, TimeoutError) as e:
+                print(f"net blip ({e}) — retrying in 5s…", flush=True)
+                time.sleep(5)
+                continue
             if res.get("ok") is False:
                 if "rate limited" in str(res.get("msg", "")):
                     print("throttled — backing off 10s…", flush=True)
