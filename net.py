@@ -20,6 +20,54 @@ RECV_LIMIT = 1 << 20
 FAUCET_DIFFICULTY = 5  # leading hex zeros (~1M hashes, a few seconds in-browser)
 FAUCET_AMOUNT = 50_000  # watts = 0.05 INFR per claim, 1 claim/IP/day
 
+WALLET_HTML = """<!doctype html><html><head><meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Infer Web Wallet (testnet)</title>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:3em auto;padding:0 1em;color:#222}
+input{width:100%;padding:.6em;font-family:monospace;box-sizing:border-box}button{padding:.6em 1.2em;margin:.4em .2em 0 0}
+#log{background:#f4f4f4;padding:.8em;white-space:pre-wrap;min-height:3em}
+.warn{background:#fff3cd;padding:.8em;border:1px solid #e0c36a}</style></head><body>
+<h1>&#9672; Infer Web Wallet</h1>
+<p class=warn><b>Testnet toy:</b> keys live on the server (custodial) — fine for worthless
+test watts, never for real money. No mining here; miners run <tt>miner_node.py</tt>.</p>
+<div id=setup><button id=new>＋ Create wallet</button></div>
+<div id=app style="display:none">
+<p>Address: <code id=addr></code><br>Balance: <b id=bal></b></p>
+<input id=to placeholder="pq1... recipient">
+<input id=amt placeholder="watts (e.g. 1000)">
+<button id=send>Send</button> <button id=refresh>Refresh</button>
+<h3>Transfers</h3><div id=txs></div>
+</div>
+<p id=log>idle</p>
+<p><a href='/'>faucet</a> &middot; <a href='/blocks'>explorer</a></p>
+<script>
+const log = m => document.getElementById('log').textContent = m;
+async function me(){const r = await fetch('/api/web/me');return r.json();}
+async function refresh(){
+ const m = await me();
+ if(!m.ok){document.getElementById('setup').style.display='';document.getElementById('app').style.display='none';log(m.msg);return;}
+ document.getElementById('setup').style.display='none';document.getElementById('app').style.display='';
+ document.getElementById('addr').textContent = m.addr;
+ document.getElementById('bal').textContent = m.balance_watts >= 1e6
+  ? (m.balance_watts/1e6).toFixed(3)+' INFR' : m.balance_watts+' watts';
+ document.getElementById('txs').innerHTML = m.transfers.map(t =>
+  `<div>${t[0]===m.addr?'&larr;':'&rarr;'} ${t[2]} watts <small>${(t[0]===m.addr?t[1]:t[0]).slice(0,18)}…</small></div>`).join('') || '(none yet — claim the faucet)';
+ log('synced');
+}
+document.getElementById('new').onclick = async () => {
+ const r = await (await fetch('/api/web/new',{method:'POST'})).json();
+ log(r.ok ? 'wallet created' : 'denied: '+r.msg); refresh();
+};
+document.getElementById('send').onclick = async () => {
+ const r = await (await fetch('/api/web/send',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({to:document.getElementById('to').value.trim(),
+  amount:parseInt(document.getElementById('amt').value)})})).json();
+ log(r.ok ? 'queued — confirms in next block' : 'denied: '+r.msg); refresh();
+};
+document.getElementById('refresh').onclick = refresh;
+refresh();
+</script></body></html>"""
+
 FAUCET_HTML = """<!doctype html><html><head><meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Infer Testnet Faucet</title>
@@ -30,6 +78,7 @@ input{width:100%;padding:.6em;font-family:monospace}button{padding:.6em 1.2em;ma
 <p>Free test INFR. The captcha is proof-of-work: your browser grinds SHA-256
 until the hash has <b>5 leading zeros</b> — bots pay CPU per claim, just like miners.</p>
 <p>Amount: <b>50,000 watts (0.05 INFR)</b> &middot; 1 claim per IP per day &middot; test funds only.</p>
+<p>Got watts? Open the <a href='/wallet'>web wallet</a> to hold and send them &middot; <a href='/blocks'>explorer</a></p>
 <input id=addr placeholder="pq1... your wallet address">
 <button id=go>Solve captcha &amp; claim</button>
 <p id=log>idle</p>
@@ -175,6 +224,18 @@ class GatewayServer:
             self._http(f, 200, self._explorer_block(path[len("/block/"):]).encode(),
                        "text/html; charset=utf-8")
             return None
+        if path == "/wallet" and method == "GET":
+            self._http(f, 200, WALLET_HTML.encode(), "text/html; charset=utf-8")
+            return None
+        if path == "/api/web/new" and method == "POST":
+            self._web_new(f, ip)
+            return None
+        if path == "/api/web/me" and method == "GET":
+            self._web_me(f, headers)
+            return None
+        if path == "/api/web/send" and method == "POST":
+            self._web_send(f, headers, body)
+            return None
         self._http(f, 200, b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}',
                    "application/json")
         return None
@@ -184,6 +245,115 @@ class GatewayServer:
         f.write(f"HTTP/1.1 {code} {'OK' if code == 200 else 'ERR'}\r\nContent-Type: {ctype}\r\n"
                 f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
         f.flush()
+
+    # -- custodial web wallet (TESTNET ONLY) -------------------------------
+    # Keys live server-side so browsers need no PQ-in-JS. That makes the
+    # gateway a custodian: fine for worthless test watts, NEVER for real
+    # money. Sessions = random 256-bit tokens in HttpOnly cookies.
+    WEB_SESSION_DAYS = 30
+    WEB_NEW_PER_IP_PER_DAY = 10
+
+    @staticmethod
+    def _cookies(headers: dict) -> dict:
+        out = {}
+        for part in headers.get("cookie", "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def _web_tables(self):
+        self.conn.execute("CREATE TABLE IF NOT EXISTS web_wallets(addr TEXT PRIMARY KEY, seed_hex TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS web_sessions(token TEXT PRIMARY KEY, addr TEXT, expiry REAL)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS web_creates(ip TEXT, day INTEGER)")
+
+    def _web_session_addr(self, headers: dict):
+        import hashlib as _hl
+        import time as _t
+        tok = self._cookies(headers).get("infer_session", "")
+        if not tok or len(tok) > 128:
+            return None
+        with self.lock:
+            self._web_tables()
+            row = self.conn.execute("SELECT addr, expiry FROM web_sessions WHERE token=?",
+                                    (_hl.sha256(tok.encode()).hexdigest(),)).fetchone()
+        return row[0] if row and row[1] > _t.time() else None
+
+    def _web_new(self, f, ip):
+        import hashlib as _hl
+        import secrets as _s
+        import time as _t
+        import pq as _pq
+        with self.lock:
+            self._web_tables()
+            day = int(_t.time() // 86400)
+            n = self.conn.execute("SELECT COUNT(*) FROM web_creates WHERE ip=? AND day=?",
+                                  (ip, day)).fetchone()[0]
+            if n >= self.WEB_NEW_PER_IP_PER_DAY:
+                self.conn.commit()
+                self._http(f, 429, b'{"ok":false,"msg":"too many wallets today"}', "application/json")
+                return
+            k = _pq.generate()
+            root = _pq.root_of(bytes.fromhex(k["seed"])).hex()
+            from ledger import register_pq
+            register_pq(self.conn, k["addr"], root)
+            self.conn.execute("INSERT INTO web_wallets VALUES(?,?)", (k["addr"], k["seed"]))
+            tok = _s.token_hex(32)
+            self.conn.execute("INSERT INTO web_sessions VALUES(?,?,?)",
+                              (_hl.sha256(tok.encode()).hexdigest(), k["addr"],
+                               _t.time() + self.WEB_SESSION_DAYS * 86400))
+            self.conn.execute("INSERT INTO web_creates VALUES(?,?)", (ip, day))
+            self.conn.commit()
+        f.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                f"Set-Cookie: infer_session={tok}; HttpOnly; SameSite=Lax; Path=/; "
+                f"Max-Age={self.WEB_SESSION_DAYS * 86400}\r\n".encode())
+        body = ('{"ok":true,"addr":"%s"}' % k["addr"]).encode()
+        f.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        f.flush()
+
+    def _web_me(self, f, headers):
+        addr = self._web_session_addr(headers)
+        if addr is None:
+            self._http(f, 401, b'{"ok":false,"msg":"no session (create a wallet first)"}',
+                       "application/json")
+            return
+        from ledger import balance_watts
+        with self.lock:
+            bal = balance_watts(self.conn, addr)
+            txs = self.conn.execute(
+                "SELECT from_id, to_id, amount_watts FROM transfers "
+                "WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT 20", (addr, addr)).fetchall()
+        self._http(f, 200, json.dumps(
+            {"ok": True, "addr": addr, "balance_watts": bal, "transfers": txs}).encode(),
+            "application/json")
+
+    def _web_send(self, f, headers, body: bytes):
+        addr = self._web_session_addr(headers)
+        if addr is None:
+            self._http(f, 401, b'{"ok":false,"msg":"no session"}', "application/json")
+            return
+        try:
+            req = json.loads(body.decode() or "{}")
+            to, amount = req["to"], int(req["amount"])
+        except (ValueError, KeyError, TypeError):
+            self._http(f, 400, b'{"ok":false,"msg":"need {to, amount}"}', "application/json")
+            return
+        if not isinstance(to, str) or not to.startswith("pq1") or len(to) > 64 or amount <= 0:
+            self._http(f, 400, b'{"ok":false,"msg":"bad to/amount"}', "application/json")
+            return
+        import pq as _pq
+        from ledger import next_ots
+        with self.lock:
+            row = self.conn.execute("SELECT seed_hex FROM web_wallets WHERE addr=?", (addr,)).fetchone()
+            ots = next_ots(self.conn, addr)
+        if row is None:
+            self._http(f, 400, b'{"ok":false,"msg":"unknown wallet"}', "application/json")
+            return
+        pkg = _pq.sign(row[0], ots, addr, to, amount)
+        ok, msg = self.mempool_add({"type": "transfer", "from": addr, "to": to,
+                                    "amount": amount, "sig": pkg})
+        self._http(f, 200 if ok else 400, json.dumps({"ok": ok, "msg": msg}).encode(),
+                   "application/json")
 
     def _explorer_blocks(self) -> str:
         from chain import header_hash
