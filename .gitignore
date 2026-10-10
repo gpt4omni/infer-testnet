@@ -1,0 +1,12 @@
+*.db
+*.dat
+*.pem
+wallet-*.json
+operator.json
+__pycache__/
+outbox/
+livenet/
+testnet/
+wan-demo/
+chaindemo/
+*.log

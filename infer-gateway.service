@@ -1,0 +1,23 @@
+[Unit]
+Description=Infer testnet gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=infer
+WorkingDirectory=/opt/inference-coin
+Environment=LD_LIBRARY_PATH=/home/infer/.local/lib
+ExecStart=/usr/bin/python3 -u gateway_node.py --host 0.0.0.0 --port 19191 \
+  --db /var/lib/infer/gateway.db --mine --mine-interval 20 \
+  --reward-addr REPLACE_WITH_OPERATOR_PQ_ADDR
+Restart=always
+RestartSec=10
+# abuse + resource containment
+MemoryMax=2G
+CPUQuota=200%
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
