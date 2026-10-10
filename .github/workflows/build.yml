@@ -1,0 +1,70 @@
+name: package-wallet
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # tkinter included; widest wheel coverage
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller -y wallet.spec
+      - run: Compress-Archive -Path infer-wallet -DestinationPath infer-wallet-windows-x86_64.zip
+        shell: pwsh
+        working-directory: dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: infer-wallet-windows-x86_64
+          path: dist/infer-wallet-windows-x86_64.zip
+
+  linux-appimage:
+    runs-on: ubuntu-22.04  # older glibc = runs on more distros
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-tk libfuse2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller -y wallet.spec
+      - run: python3 tools/make_icon.py infer-wallet.png
+      - name: assemble AppDir
+        run: |
+          set -e
+          mkdir -p AppDir/usr/bin
+          cp -r dist/infer-wallet/* AppDir/usr/bin/
+          cp infer-wallet.png AppDir/infer-wallet.png
+          cp infer-wallet.png AppDir/.DirIcon
+          cat > AppDir/infer-wallet.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Infer Wallet
+          Comment=Mine and hold Infer (INFR) testnet watts
+          Exec=infer-wallet
+          Icon=infer-wallet
+          Terminal=false
+          Type=Application
+          Categories=Finance;Network;
+          EOF
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/infer-wallet" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+      - name: build AppImage
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          ./appimagetool AppDir Infer-Wallet-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Infer-Wallet-x86_64.AppImage
+          path: Infer-Wallet-x86_64.AppImage
