@@ -161,6 +161,8 @@ class GatewayServer:
         self.infer_q = _c.deque()  # open-prompt jobs awaiting a miner
         self.infer_results = {}  # job_id -> {status, output, miner, ms, customer}
         self.infer_prompts = {}  # job_id -> prompt (scoring context after serve)
+        self.infer_terms = {}  # job_id -> (customer, quoted_watts) for auto-settle
+        self.D1_PAY_THRESHOLD = 0.3  # d1 score at/above this settles automatically
         self.infer_seq = 0
         self.miner_stats = {}  # miner_id -> [accepted, total] (customer feedback)
         self.d1_hist = {}  # miner_id -> deque(maxlen=20) of recent d1 scores
@@ -672,6 +674,7 @@ class GatewayServer:
                 self.infer_q.append({"job_id": jid, "prompt": prompt, "max_tokens": max_tok,
                                      "customer": req.get("customer", ""), "quoted_watts": quote})
                 self.infer_prompts[jid] = prompt
+                self.infer_terms[jid] = (req.get("customer", ""), quote)
             send_msg(f, {"ok": True, "job_id": jid, "quoted_watts": quote})
             return True
         if op == "infer_result":
@@ -688,9 +691,11 @@ class GatewayServer:
                 st[1] += 1
                 self.note_seen(req.get("miner_id", ""))
             send_msg(f, {"ok": True})
-            # d1 quality score: best-effort, never blocks payment. Ground truth
-            # (unit tests) and customer feedback still rule; this prices the
-            # subjective remainder and feeds capability profiles.
+            # d1 quality score gates payment automatically: at/above threshold
+            # the quoted watts settle with no customer action, so answers
+            # can't be taken for free and good work can't be stiffed.
+            # Ground truth (unit tests) still rules code tasks; feedback stays
+            # as a pure rating signal.
             try:
                 from judge import DJudge
                 with self.lock:
@@ -698,12 +703,39 @@ class GatewayServer:
                 q = DJudge(timeout=30).quality(ctx, str(req.get("output", ""))[:2000])
             except Exception:
                 q = None
+            paid = 0
             if q is not None:
                 with self.lock:
                     if req["job_id"] in self.infer_results:
                         self.infer_results[req["job_id"]]["d1_quality"] = round(q, 3)
                     import collections as _dq
                     self.d1_hist.setdefault(req.get("miner_id", ""), _dq.deque(maxlen=20)).append(q)
+            # AUTO-SETTLE: score at/above threshold pays quoted watts immediately.
+            # No accept button anywhere: customers can't take answers for free,
+            # miners can't be stiffed. Below threshold: no pay, stats dinged.
+            if q is not None and q >= self.D1_PAY_THRESHOLD:
+                from ledger import balance_watts
+                from money import split_customer_fee
+                with self.lock:
+                    terms = self.infer_terms.pop(req["job_id"], ("", 0))
+                cust, quote = terms
+                miner = req.get("miner_id", "")
+                if cust and quote > 0 and balance_watts(self.conn, cust) >= quote:
+                    m_amt, b_amt = split_customer_fee(quote)
+                    import time as _st
+                    with self.lock:
+                        self.conn.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts)"
+                                          " VALUES(?,?,?,?)", (cust, miner, m_amt, _st.time()))
+                        if b_amt:
+                            self.conn.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts)"
+                                              " VALUES(?,?,?,?)", (cust, "burn", b_amt, _st.time()))
+                        self.conn.commit()
+                        if req["job_id"] in self.infer_results:
+                            self.infer_results[req["job_id"]]["paid_watts"] = m_amt
+                    paid = m_amt
+            if paid == 0:
+                with self.lock:
+                    self.infer_terms.pop(req["job_id"], None)
             return True
         if op == "feedback":
             with self.lock:

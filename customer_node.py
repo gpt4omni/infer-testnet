@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""Infer customer: submit open prompts, review answers, pay on accept.
-
-  python3 customer_node.py --gateway 127.0.0.1:19191 --no-tls --keyfile c.json \\
-      --prompt "Write a haiku about blocks" --accept ask
-
-Flow: quote -> poll result -> show answer + d1 score -> accept? pay : walk.
-Pay = PQ-signed transfer (quoted watts) into the mempool + feedback op.
-Reject = feedback(false), miner unpaid, stats dinged. No escrow, no trust:
-money moves only after the customer says so.
-"""
+"""Infer customer: submit open prompts, get answers. Payment is automatic:
+d1 scores the delivery and good work settles on its own — no accept button,
+no free sampling. This CLI only reports + rates (feedback op)."""
 import argparse
 import json
 import os
@@ -50,8 +43,9 @@ def main():
     ap.add_argument("--keyfile", required=True)
     ap.add_argument("--prompt", default="", help="prompt text ('-' reads stdin)")
     ap.add_argument("--max-tokens", type=int, default=128)
-    ap.add_argument("--accept", default="ask", choices=["ask", "auto", "never"])
-    ap.add_argument("--auto-min-quality", type=float, default=0.3)
+    ap.add_argument("--rate", default="auto", choices=["auto", "ask", "none"],
+                    help="feedback rating only; payment is automatic on d1 score")
+    ap.add_argument("--rate-min-quality", type=float, default=0.3)
     ap.add_argument("--wait", type=int, default=180)
     a = ap.parse_args()
 
@@ -89,29 +83,21 @@ def main():
     print(f"--- answer (by {res.get('miner','?')[:16]}.., d1={res.get('d1_quality', '?')}) ---")
     print(res.get("output", ""))
     print("--- end ---")
-
-    accept = False
-    if a.accept == "auto":
-        q = res.get("d1_quality")
-        accept = (q is not None and q >= a.auto_min_quality)
-        print(f"auto: d1={q} threshold={a.auto_min_quality} -> {'accept' if accept else 'reject'}")
-    elif a.accept == "ask":
-        accept = input("accept and pay? [y/N] ").strip().lower() == "y"
-    call({"op": "feedback", "miner_id": res.get("miner", ""), "accept": bool(accept)})
-
-    if not accept:
-        print("rejected — miner unpaid, stats dinged.")
-        return
-    import pq
-    from money import fmt_watts
-    n = call({"op": "next_ots", "miner_id": key["addr"]})["ots"]
-    pkg = pq.sign(key["seed"], n, key["addr"], res["miner"], quote)
-    tx = {"type": "transfer", "from": key["addr"], "to": res["miner"], "amount": quote, "sig": pkg}
-    s = call({"op": "submit_tx", "tx": tx})
-    if s.get("ok"):
-        print(f"paid {fmt_watts(quote)} — confirms in next block.")
+    if res.get("paid_watts"):
+        from money import fmt_watts
+        print(f"auto-settled {fmt_watts(res['paid_watts'])} to miner (d1 gate passed).")
     else:
-        print(f"payment rejected: {s.get('msg')} (feedback stands)")
+        print("below pay line — miner unpaid.")
+
+    rate = False
+    if a.rate == "auto":
+        q = res.get("d1_quality")
+        rate = (q is not None and q >= a.rate_min_quality)
+        print(f"rating: {'good' if rate else 'bad'} (d1={q})")
+    elif a.rate == "ask":
+        rate = input("rate this answer good? [y/N] ").strip().lower() == "y"
+    call({"op": "feedback", "miner_id": res.get("miner", ""), "accept": bool(rate)})
+    print("feedback recorded.")
 
 
 if __name__ == "__main__":

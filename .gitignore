@@ -10,3 +10,6 @@ testnet/
 wan-demo/
 chaindemo/
 *.log
+*-wal
+*-shm
+*-journal

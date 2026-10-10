@@ -236,8 +236,6 @@ class Wallet:
         self.pg_cancel_btn = ttk.Button(btnrow, text="Cancel", command=self.cancel_pg,
                                         state="disabled")
         self.pg_cancel_btn.pack(side="left", padx=6)
-        self.pg_pay_btn = ttk.Button(btnrow, text="Accept & pay", command=self.pay_pg, state="disabled")
-        self.pg_pay_btn.pack(side="left", padx=6)
         self.pg_meta = tk.StringVar(value="")
         ttk.Label(btnrow, textvariable=self.pg_meta, font=("", 9)).pack(side="left", padx=6)
         self.pg_answer = tk.Text(pg, height=10, width=60, wrap="word", state="disabled",
@@ -509,7 +507,6 @@ class Wallet:
             self.pg_show("", "type a prompt first")
             return
         self.pg_ask_btn.configure(state="disabled")
-        self.pg_pay_btn.configure(state="disabled")
         self.pg_cancel_btn.configure(state="normal")
         self.pg_job = None
         self._pg_cancel.clear()
@@ -535,7 +532,7 @@ class Wallet:
                 return
             jid, quote = r["job_id"], r["quoted_watts"]
             import time as _t
-            out, miner = None, ""
+            out, miner, paid_txt = None, "", ""
             for _ in range(40):
                 if self._pg_cancel.is_set():
                     self.events.put(("pgfail", "cancelled"))
@@ -544,13 +541,16 @@ class Wallet:
                 res = self.gw_rpc({"op": "infer_result", "job_id": jid}, timeout=15)
                 if res.get("ok"):
                     out, miner = res.get("output", ""), res.get("miner", "")
+                    if res.get("paid_watts"):
+                        paid_txt = f" auto-paid {fmt_watts(res['paid_watts'])}"
+                    elif res.get("d1_quality") is not None:
+                        paid_txt = f" d1={res['d1_quality']:.2f} below pay line — miner unpaid"
                     break
             if out is None:
                 self.events.put(("pgfail", "no miner served it in time"))
                 return
-            score = self._pg_score(prompt, out)
             self.pg_job = {"miner": miner, "quote": quote, "output": out}
-            meta = f"by {miner[:16]}… quoted {quote} watts" + (f" d1={score:.2f}" if score is not None else "")
+            meta = f"by {miner[:16]}… quoted {quote} watts" + paid_txt
             self.events.put(("pg", (out, meta)))
         except (ConnectionError, OSError, ValueError, KeyError) as e:
             self.events.put(("pgfail", f"error: {e}"))
@@ -572,16 +572,6 @@ class Wallet:
             return DJudge(timeout=30).quality(prompt, out)
         except Exception:
             return None
-
-    def pay_pg(self):
-        if not self.pg_job or not self.gw:
-            self.pg_show(self.pg_answer.get("1.0", "end").strip(),
-                         "nothing to pay (local mode is free)")
-            return
-        to, amount = self.pg_job["miner"], self.pg_job["quote"]
-        self.to_id.set(to)
-        self.amount.set(str(amount))
-        self.send()
 
     # -- mining loop (worker thread; DB via own connection) ----------------
     def loop(self, miner):
@@ -692,8 +682,6 @@ class Wallet:
                     self.pg_show(out, meta)
                     self.pg_ask_btn.configure(state="normal")
                     self.pg_cancel_btn.configure(state="disabled")
-                    if self.pg_job and self.gw:
-                        self.pg_pay_btn.configure(state="normal")
                     self.refresh()
                     continue
                 if kind == "pgfail":

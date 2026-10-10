@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS pq_accounts(addr TEXT PRIMARY KEY, root_hex TEXT);
 
 
 def connect(path="ledger.db", check_same_thread=True):
-    c = sqlite3.connect(path, check_same_thread=check_same_thread)
+    c = sqlite3.connect(path, check_same_thread=check_same_thread, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.executescript(SCHEMA)
     cols = {r[1] for r in c.execute("PRAGMA table_info(transfers)")}
     for col in ("sig_json TEXT", "ots INTEGER"):
