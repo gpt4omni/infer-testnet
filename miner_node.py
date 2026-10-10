@@ -111,33 +111,47 @@ def main():
     if a.mine:
         mine_forever(a)
         return
-    if a.no_tls:
-        from net import MinerClient
-        print("WARNING: plaintext transport (loopback only)", flush=True)
-        # plain client has no signed submits; WAN must use TLS+WANMiner
-        cl = MinerClient(key["addr"], be, host, int(port), model, a.price, infer=a.infer)
-        run = cl.run_job
-    else:
-        if not a.pin:
-            raise SystemExit("--pin required (gateway prints it at startup)")
+    def connect():
+        if a.no_tls:
+            from net import MinerClient
+            return MinerClient(key["addr"], be, host, int(port), model, a.price,
+                               infer=a.infer), "plain"
         from net import WANMiner
-        cl = WANMiner(key, be, host, int(port), a.pin, model, a.price, infer=a.infer)
-        run = cl.run_job
+        return WANMiner(key, be, host, int(port), a.pin, model, a.price,
+                        infer=a.infer), "wan"
+
+    if a.no_tls:
+        print("WARNING: plaintext transport (loopback only)", flush=True)
+    elif not a.pin:
+        raise SystemExit("--pin required (gateway prints it at startup)")
+    cl, kind = connect()
+    box = [cl]
+
+    def run():
+        if a.infer:
+            knd, what, res = box[0].run_mixed_once()
+            return (f"infer:{what}" if knd == "infer" else what), res
+        return box[0].run_job()
+
+    def reconnect():
+        try:
+            box[0].close()
+        except Exception:
+            pass
+        box[0], _ = connect()
 
     earned, n = 0, 0
-    if a.infer:
-        def run():
-            kind, what, res = cl.run_mixed_once()
-            return (f"infer:{what}" if kind == "infer" else what), res
-    else:
-        run = cl.run_job
     try:
         while a.jobs == 0 or n < a.jobs:
             try:
                 task, res = run()
             except (ConnectionError, OSError, TimeoutError) as e:
-                print(f"net blip ({e}) — retrying in 5s…", flush=True)
+                print(f"net blip ({e}) — reconnecting in 5s…", flush=True)
                 time.sleep(5)
+                try:
+                    reconnect()
+                except Exception as e2:
+                    print(f"reconnect failed ({e2}) — retrying…", flush=True)
                 continue
             if res.get("ok") is False:
                 if "rate limited" in str(res.get("msg", "")):
@@ -151,7 +165,10 @@ def main():
             print(f"job {n}: {task} pass={int(res.get('passed', 1))} "
                   f"+{fmt_watts(res.get('payout_watts', 0))} total={fmt_watts(earned)}", flush=True)
     finally:
-        cl.close()
+        try:
+            box[0].close()
+        except Exception:
+            pass
     print(f"done: {n} jobs, {fmt_watts(earned)}")
 
 
