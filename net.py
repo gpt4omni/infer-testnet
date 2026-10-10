@@ -154,6 +154,11 @@ class GatewayServer:
         self.infer_prompts = {}  # job_id -> prompt (scoring context after serve)
         self.infer_seq = 0
         self.miner_stats = {}  # miner_id -> [accepted, total] (customer feedback)
+        self.d1_hist = {}  # miner_id -> deque(maxlen=20) of recent d1 scores
+        self.miner_seen = {}  # miner_id -> last-seen epoch seconds
+        self.D1_LOW = 0.3  # below: deprioritized for paid infer work
+        self.D1_GOOD = 0.5  # at/above: preferred
+        self.ACTIVE_TTL = 120  # seconds a miner counts as connected
         try:
             self.chain = load_chain(chain_path)
         except ValueError as e:
@@ -504,11 +509,20 @@ class GatewayServer:
                                    float(hello.get("price", 0)))
                 send_msg(f, {"ok": True, "msg": "registered"})
                 infer_ok = bool(hello.get("infer"))  # new clients also take open prompts
+                self.note_seen(hello.get("miner_id", ""))
                 while True:
                     req = recv_msg(f)
                     if req.get("op") == "get_job":
                         with self.lock:
-                            ij = self.infer_q.popleft() if (infer_ok and self.infer_q) else None
+                            ij = None
+                            if infer_ok and self.infer_q:
+                                # route to this poller only if no better miner is active;
+                                # low-quality miners keep task flow (still paid by subsidy)
+                                import time as _gt
+                                self.note_seen(req.get("miner_id", "") or hello.get("miner_id", ""))
+                                me = req.get("miner_id", "") or hello.get("miner_id", "")
+                                if self.infer_eligible(me):
+                                    ij = self.infer_q.popleft()
                             if ij is None:
                                 self.seq += 1
                                 task = self.tasks[self.seq % len(self.tasks)]
@@ -620,6 +634,7 @@ class GatewayServer:
                     "miner": req.get("miner_id", ""), "ms": float(req.get("latency_ms", 0))}
                 st = self.miner_stats.setdefault(req.get("miner_id", ""), [0, 0])
                 st[1] += 1
+                self.note_seen(req.get("miner_id", ""))
             send_msg(f, {"ok": True})
             # d1 quality score: best-effort, never blocks payment. Ground truth
             # (unit tests) and customer feedback still rule; this prices the
@@ -635,6 +650,8 @@ class GatewayServer:
                 with self.lock:
                     if req["job_id"] in self.infer_results:
                         self.infer_results[req["job_id"]]["d1_quality"] = round(q, 3)
+                    import collections as _dq
+                    self.d1_hist.setdefault(req.get("miner_id", ""), _dq.deque(maxlen=20)).append(q)
             return True
         if op == "feedback":
             with self.lock:
@@ -777,6 +794,33 @@ class GatewayServer:
             self.checkpoint_doc = doc
             self.chain.set_checkpoint(int(doc["height"]), doc["hash"])
         return True, f"checkpoint height={doc['height']} enforced"
+
+    def d1_avg(self, miner_id: str):
+        """Rolling mean quality, None for unmeasured miners (probation: eligible)."""
+        import collections as _c
+        h = self.d1_hist.get(miner_id)
+        if not h:
+            return None
+        return sum(h) / len(h)
+
+    def note_seen(self, miner_id: str):
+        import time as _t
+        if miner_id:
+            self.miner_seen[miner_id] = _t.time()
+
+    def infer_eligible(self, miner_id: str) -> bool:
+        """Paid infer work goes to the capable first. Below-threshold miners
+        get tasks (still paid by subsidy) unless nobody better is around —
+        coverage beats purity, but quality earns the premium flow."""
+        import time as _t
+        avg = self.d1_avg(miner_id)
+        if avg is None or avg >= self.D1_LOW:
+            return True
+        now = _t.time()
+        for m, seen in self.miner_seen.items():
+            if m != miner_id and now - seen < self.ACTIVE_TTL and (self.d1_avg(m) or 0) >= self.D1_GOOD:
+                return False
+        return True
 
     def _has_ots(self):
         return self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='ots_used'").fetchone()

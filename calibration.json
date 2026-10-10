@@ -1,0 +1,20 @@
+[
+ {"prompt": "write add(a,b)", "answer": "def solve(a, b):\n    return a + b\n", "human": 1.0,
+  "why": "exact, idiomatic"},
+ {"prompt": "write add(a,b)", "answer": "def solve(a, b):\n    return 42\n", "human": 0.0,
+  "why": "confidently wrong"},
+ {"prompt": "write add(a,b)", "answer": "def solve(a, b):\n    s = 0\n    for i in range(b):\n        s += 1\n    return s if a == 0 else s + a\n", "human": 0.7,
+  "why": "correct on nonneg ints, breaks negatives, ugly"},
+ {"prompt": "Write a haiku about blocks", "answer": "Blocks rise in the air,\nSolid structures, yet flexible,\nNature's masterpiece.", "human": 0.75,
+  "why": "real haiku, on theme, middle line wobbly"},
+ {"prompt": "Write a haiku about blocks", "answer": "mock answer (25 chars in): Write a haiku about blocks", "human": 0.05,
+  "why": "placeholder echo, zero content"},
+ {"prompt": "reverse the string 'abc'", "answer": "def solve(s):\n    return s[::-1]\n", "human": 1.0,
+  "why": "exact"},
+ {"prompt": "reverse the string 'abc'", "answer": "The reversed string is cba, achieved by iterating backwards through each character and building a new string.", "human": 0.6,
+  "why": "right answer, wrong shape (prose not code)"},
+ {"prompt": "what is 6*7?", "answer": "42", "human": 1.0, "why": "exact"},
+ {"prompt": "what is 6*7?", "answer": "6*7 is equal to forty-two, which is also famously the answer to life, the universe and everything according to Douglas Adams.", "human": 0.5,
+  "why": "correct but bloated for the ask"},
+ {"prompt": "summarize: the cat sat", "answer": "", "human": 0.0, "why": "empty"}
+]
