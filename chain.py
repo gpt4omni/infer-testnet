@@ -28,6 +28,8 @@ CLAMP = 4  # max 4x swing per retarget, like Bitcoin
 # Testnet block-reward cap (mainnet: money.daily_subsidy_infr prorated).
 # Enforced in add(): exactly one subsidy mint allowed, first tx only.
 MAX_BLOCK_REWARD_WATTS = 5_000_000  # 5 INFR
+MAX_REORG_DEPTH = 6  # refuse heavier forks branching deeper than this (testnet training wheels)
+MTP_WINDOW = 11  # median-time-past window, Bitcoin-style
 
 
 def canon(o) -> bytes:
@@ -91,6 +93,34 @@ class Chain:
         self.blocks: dict[str, dict] = {}  # hash -> block
         self.tip = ""
         self.height = -1
+        self.checkpoint = None  # (height, hash): operator-pinned history, verified externally
+
+    def set_checkpoint(self, height: int, hash_: str):
+        self.checkpoint = (height, hash_)
+
+    def _mtp(self, prev_hash: str) -> float:
+        ts, b = [], prev_hash
+        while b and len(ts) < MTP_WINDOW:
+            blk = self.blocks.get(b)
+            if blk is None:
+                break
+            ts.append(blk["header"]["timestamp"])
+            b = blk["header"]["prev_hash"] if blk["header"]["height"] else ""
+        ts.sort()
+        return ts[len(ts) // 2] if ts else 0.0
+
+    def _ancestor(self, a: str, b_: str) -> str:
+        seen = set()
+        while a:
+            seen.add(a)
+            blk = self.blocks.get(a)
+            a = blk["header"]["prev_hash"] if blk and blk["header"]["height"] else ""
+        while b_:
+            if b_ in seen:
+                return b_
+            blk = self.blocks.get(b_)
+            b_ = blk["header"]["prev_hash"] if blk and blk["header"]["height"] else ""
+        return ""
 
     def add(self, block: dict) -> tuple[bool, str]:
         """Validate + extend. Heaviest chain wins (cumulative work approx =
@@ -111,11 +141,20 @@ class Chain:
                 return False, "bad height"
             if h["timestamp"] < prev["header"]["timestamp"]:
                 return False, "timestamp regression"
+            if h["timestamp"] <= self._mtp(h["prev_hash"]):
+                return False, "timestamp not above median-past"
         bh = header_hash(h)
         if not self._valid_money(block):
             return False, "bad coinbase (only one capped subsidy mint, first tx only)"
         self.blocks[bh] = block
         if self.work(bh) > self.work(self.tip):
+            if self.tip:
+                anc = self._ancestor(bh, self.tip)
+                fork_h = self.blocks[anc]["header"]["height"] if anc else -1
+                if self.checkpoint and fork_h < self.checkpoint[0]:
+                    return True, "stored, reorg below checkpoint refused"
+                if self.height - fork_h > MAX_REORG_DEPTH:
+                    return True, f"stored, reorg too deep (> {MAX_REORG_DEPTH})"
             self.tip = bh
             self.height = h["height"]
         return True, "ok"
@@ -171,6 +210,11 @@ class Chain:
         for a, b in zip(path, path[1:]):
             if b["header"]["prev_hash"] != header_hash(a["header"]):
                 return False, f"broken link at {b['header']['height']}"
+        if self.checkpoint:
+            ch, chh = self.checkpoint
+            hit = [b for b in path if b["header"]["height"] == ch]
+            if not hit or header_hash(hit[0]["header"]) != chh:
+                return False, "checkpoint not on tip path"
         return True, f"ok ({len(path)} blocks)"
 
 

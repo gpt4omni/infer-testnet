@@ -147,6 +147,7 @@ class GatewayServer:
         self._idle_rounds = 0
         self.hits = {}  # ip -> deque of recent expensive-op timestamps
         self.challenges = {}  # challenge_id -> (challenge, expiry)
+        self.checkpoint_doc = None
         try:
             self.chain = load_chain(chain_path)
         except ValueError as e:
@@ -226,6 +227,13 @@ class GatewayServer:
             return None
         if path == "/wallet" and method == "GET":
             self._http(f, 200, WALLET_HTML.encode(), "text/html; charset=utf-8")
+            return None
+        if path == "/api/checkpoint" and method == "GET":
+            doc = self.checkpoint_doc
+            if doc is None:
+                self._http(f, 404, b'{"ok":false,"msg":"no checkpoint"}', "application/json")
+            else:
+                self._http(f, 200, json.dumps(doc).encode(), "application/json")
             return None
         if path == "/api/web/new" and method == "POST":
             self._web_new(f, ip)
@@ -677,6 +685,28 @@ class GatewayServer:
             send_msg(f, {"ok": ok, "msg": msg})
             return True
         return False
+
+    def load_checkpoint(self, path: str, pinned_root: str) -> tuple[bool, str]:
+        """Verify operator PQ signature + pin root, then enforce on chain."""
+        import json as _json
+        import pq as _pq
+        try:
+            with open(path) as f:
+                doc = _json.load(f)
+        except OSError as e:
+            return False, f"unreadable: {e}"
+        try:
+            msg = f"checkpoint|{doc['height']}|{doc['hash']}"
+            ok = (doc["root"] == pinned_root and
+                  _pq.verify(doc["addr"], doc["root"], doc["sig"], msg, int(doc["height"])))
+        except (KeyError, ValueError, TypeError):
+            ok = False
+        if not ok:
+            return False, "bad checkpoint signature or wrong operator root"
+        with self.lock:
+            self.checkpoint_doc = doc
+            self.chain.set_checkpoint(int(doc["height"]), doc["hash"])
+        return True, f"checkpoint height={doc['height']} enforced"
 
     def _has_ots(self):
         return self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='ots_used'").fetchone()

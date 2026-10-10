@@ -24,6 +24,8 @@ def main():
     ap.add_argument("--mine-interval", type=int, default=15)
     ap.add_argument("--reward-addr", default="", help="coinbase destination (operator PQ address)")
     ap.add_argument("--block-reward", type=int, default=5_000_000, help="watts per block (cap enforced)")
+    ap.add_argument("--checkpoint-root", default="", help="pinned operator PQ root hex")
+    ap.add_argument("--checkpoint-file", default="", help="signed checkpoint JSON to enforce+serve")
     ap.add_argument("--bits", default="", help="hex int target (default ~10s CPU blocks)")
     a = ap.parse_args()
 
@@ -41,6 +43,9 @@ def main():
                         reward_addr=a.reward_addr, block_reward=a.block_reward)
     print(f"gateway ledger: {a.db}", flush=True)
     print(f"listening: {a.host}:{srv.port} tls={a.tls} mine={a.mine}", flush=True)
+    if a.checkpoint_file and a.checkpoint_root:
+        ok, msg = srv.load_checkpoint(a.checkpoint_file, a.checkpoint_root)
+        print(f"checkpoint: {msg}", flush=True)
     if a.mine:
         srv.start_mining()
     srv.serve_forever()
