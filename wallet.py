@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""Infer test wallet: mine (mock or real 1080 Ti) + hold + send watts.
+
+Test funds only. Balances = ledger payouts + transfers.
+Run: ./wallet.sh   (sets LD_LIBRARY_PATH for local Tcl/Tk 8.6)
+"""
+import os
+import json
+import queue
+import random
+import sqlite3
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from ledger import connect, register_miner, register_pq, next_ots, transfer, balance_watts, leaderboard
+from gateway import Miner, dispatch
+from miner import MockBackend
+from money import fmt_watts, to_watts, to_infr, TICKER
+from eval import TASKS
+import pq
+
+DB = os.path.join(os.path.dirname(__file__), "wallet.db")
+KEYFILE = os.path.join(os.path.dirname(__file__), "wallet-pq.json")
+BACKENDS = {"Mock 7B (fast)": "mock", "Real 1080 Ti GPU": "gpu"}
+GPU_URL = "http://127.0.0.1:19091/health"
+
+
+def paths(profile: str):
+    """Separate DB + key per profile so two wallets never share state."""
+    base = os.path.dirname(__file__)
+    if profile in ("", "default"):
+        return os.path.join(base, "wallet.db"), os.path.join(base, "wallet-pq.json")
+    return (os.path.join(base, f"wallet-{profile}.db"),
+            os.path.join(base, f"wallet-{profile}-pq.json"))
+
+
+def _fernet(password: str, salt: bytes):
+    import base64
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.fernet import Fernet
+    raw = PBKDF2HMAC(hashes.SHA256(), 32, salt, 600_000).derive(password.encode())
+    return Fernet(base64.urlsafe_b64encode(raw))
+
+
+def _ask_password(prompt: str) -> str | None:
+    if os.environ.get("INFER_WALLET_PW"):
+        return os.environ["INFER_WALLET_PW"]
+    try:
+        from tkinter import simpledialog
+        return simpledialog.askstring("Wallet password", prompt, show="*")
+    except Exception:
+        return None
+
+
+def load_key(keyfile=None):
+    """Password-encrypted seed (Fernet/PBKDF2, 0600). Migrates legacy
+    plaintext files on first unlock. Returns (key, password)."""
+    kf = keyfile or KEYFILE
+    if os.path.exists(kf):
+        with open(kf) as f:
+            data = json.load(f)
+        if "enc" not in data:  # legacy plaintext -> encrypt now
+            pw = _ask_password("Set a password for your wallet key:")
+            if not pw:
+                return {"seed": data["seed"], "addr": data["addr"]}, None
+            save_key(data, pw, kf)
+            return data, pw
+        pw = _ask_password("Wallet password:")
+        if not pw:
+            raise SystemExit("password required")
+        f_ = _fernet(pw, bytes.fromhex(data["salt"]))
+        return json.loads(f_.decrypt(data["enc"].encode()).decode()), pw
+    pw = _ask_password("Set a password for your NEW wallet key:")
+    if not pw:
+        raise SystemExit("password required to create wallet")
+    k = pq.generate()
+    save_key(k, pw, kf)
+    return k, pw
+
+
+def save_key(key: dict, password: str | None, keyfile=None):
+    kf = keyfile or KEYFILE
+    if password is None:  # non-interactive fallback (tests); file still 0600
+        with open(kf, "w") as f:
+            json.dump(key, f)
+    else:
+        import secrets as _secrets
+        salt = _secrets.token_bytes(16)
+        tok = _fernet(password, salt).encrypt(json.dumps(key).encode()).decode()
+        with open(kf, "w") as f:
+            json.dump({"enc": tok, "salt": salt.hex(), "addr": key["addr"]}, f)
+    os.chmod(kf, 0o600)
+
+
+def gpu_alive() -> bool:
+    import urllib.request
+    try:
+        urllib.request.urlopen(GPU_URL, timeout=4)
+        return True
+    except Exception:
+        return False
+
+
+class Wallet:
+    def __init__(self, root, profile="default", gw=None):
+        self.root = root
+        self.profile = profile
+        self.gw = gw  # None = local mode; else dict(host, port, pin, tls)
+        self.db_path, self.keyfile = paths(profile)
+        mode = f"via {gw['host']}:{gw['port']}" if gw else "local"
+        self._mode = mode
+        root.title(f"Infer Wallet [{profile}] {mode} — TESTNET ({TICKER})")
+        root.geometry("640x560")
+        try:
+            style = ttk.Style()
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+        except Exception:
+            pass
+        self.conn = connect(self.db_path)
+        self.key, self._pw = load_key(self.keyfile)
+        register_pq(self.conn, self.key["addr"], pq.root_of(bytes.fromhex(self.key["seed"])).hex())
+        self.mining = threading.Event()
+        self.events: queue.Queue = queue.Queue()
+        self.session_earned = 0
+        self.session_jobs = 0
+
+        # header ------------------------------------------------------
+        hdr = ttk.Frame(root, padding=(10, 8, 10, 0))
+        hdr.grid(sticky="ew")
+        hdr.columnconfigure(0, weight=1)
+        ttk.Label(hdr, text="◈ Infer Wallet", font=("", 14, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(hdr, text="TESTNET — no real funds", foreground="#a60",
+                  font=("", 9, "bold")).grid(row=0, column=1, sticky="e")
+
+        # account card -------------------------------------------------
+        acct = ttk.LabelFrame(root, text="Account", padding=8)
+        acct.grid(sticky="ew", padx=10, pady=6)
+        acct.columnconfigure(1, weight=1)
+        ttk.Label(acct, text="Address").grid(row=0, column=0, sticky="w")
+        self.mid = tk.StringVar(value=self.key["addr"])
+        ttk.Entry(acct, textvariable=self.mid, width=40, state="readonly",
+                  font=("TkFixedFont",)).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(acct, text="Copy", width=6, command=self.copy_addr).grid(row=0, column=2)
+        ttk.Label(acct, text="Backend").grid(row=1, column=0, sticky="w", pady=2)
+        brow = ttk.Frame(acct)
+        brow.grid(row=1, column=1, sticky="w", padx=4)
+        self.backend = tk.StringVar(value="Mock 7B (fast)")
+        ttk.OptionMenu(brow, self.backend, "Mock 7B (fast)", *BACKENDS,
+                       command=lambda *_: self.refresh_gpu()).pack(side="left")
+        self.gpu_dot = tk.StringVar(value="●")
+        ttk.Label(brow, textvariable=self.gpu_dot, font=("", 12)).pack(side="left", padx=6)
+        self.gpu_txt = tk.StringVar(value="gpu: …")
+        ttk.Label(brow, textvariable=self.gpu_txt, font=("", 9)).pack(side="left")
+        self.bal = tk.StringVar(value="…")
+        ttk.Label(acct, textvariable=self.bal, font=("", 15, "bold")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        otsrow = ttk.Frame(acct)
+        otsrow.grid(row=3, column=0, columnspan=3, sticky="ew", pady=2)
+        otsrow.columnconfigure(1, weight=1)
+        ttk.Label(otsrow, text="Sig keys", font=("", 9)).grid(row=0, column=0)
+        self.ots_bar = ttk.Progressbar(otsrow, maximum=pq.NKEYS, mode="determinate", length=200)
+        self.ots_bar.grid(row=0, column=1, sticky="ew", padx=6)
+        self.ots_txt = tk.StringVar(value="")
+        ttk.Label(otsrow, textvariable=self.ots_txt, font=("", 9)).grid(row=0, column=2)
+
+        # actions -------------------------------------------------------
+        btns = ttk.Frame(root, padding=(10, 0))
+        btns.grid(sticky="ew")
+        self.mine_btn = ttk.Button(btns, text="▶ Start mining", command=self.toggle_mine)
+        self.mine_btn.grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(btns, text="Faucet +1 INFR", command=self.faucet).grid(row=0, column=1, padx=2)
+        ttk.Button(btns, text="Leaderboard", command=self.show_board).grid(row=0, column=2, padx=2)
+        ttk.Button(btns, text="Verify me", command=self.verify_me).grid(row=0, column=3, padx=2)
+        ttk.Button(btns, text="Rotate key", command=self.rotate).grid(row=0, column=4, padx=2)
+        ttk.Button(btns, text="Backup seed", command=self.backup).grid(row=0, column=5, padx=2)
+        self.spin = ttk.Progressbar(btns, mode="indeterminate", length=80)
+
+        # send card ------------------------------------------------------
+        send = ttk.LabelFrame(root, text="Send watts (PQ-signed)", padding=8)
+        send.grid(sticky="ew", padx=10, pady=6)
+        send.columnconfigure(1, weight=1)
+        ttk.Label(send, text="To").grid(row=0, column=0, sticky="w")
+        self.to_id = tk.StringVar()
+        ttk.Entry(send, textvariable=self.to_id, width=40,
+                  font=("TkFixedFont",)).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(send, text="Watts").grid(row=1, column=0, sticky="w", pady=2)
+        self.amount = tk.StringVar(value="100")
+        self.amount.trace_add("write", lambda *_: self.amount_hint())
+        ttk.Entry(send, textvariable=self.amount, width=14).grid(row=1, column=1, sticky="w", padx=4)
+        self.amt_hint = tk.StringVar(value="")
+        ttk.Label(send, textvariable=self.amt_hint, font=("", 9)).grid(row=1, column=2, sticky="w")
+        ttk.Button(send, text="Send", command=self.send).grid(row=0, column=2, rowspan=2, padx=4)
+
+        # tabs ------------------------------------------------------------
+        nb = ttk.Notebook(root)
+        nb.grid(sticky="nsew", padx=10, pady=(0, 4))
+        root.rowconfigure(5, weight=1)
+        root.columnconfigure(0, weight=1)
+        self.log = tk.Text(nb, height=12, width=70, state="disabled",
+                           font=("TkFixedFont", 9), wrap="word")
+        self.log.tag_config("good", foreground="#0a5")
+        self.log.tag_config("bad", foreground="#c00")
+        nb.add(self.log, text="Activity")
+        self.jobs_tv = ttk.Treeview(nb, columns=("task", "res", "pay", "lat"), show="headings", height=8)
+        for c_, w_ in (("task", 90), ("res", 60), ("pay", 110), ("lat", 80)):
+            self.jobs_tv.heading(c_, text=c_.title())
+            self.jobs_tv.column(c_, width=w_)
+        nb.add(self.jobs_tv, text="My jobs")
+        self.tx_tv = ttk.Treeview(nb, columns=("dir", "peer", "amt"), show="headings", height=8)
+        for c_, w_ in (("dir", 60), ("peer", 300), ("amt", 130)):
+            self.tx_tv.heading(c_, text=c_.title())
+            self.tx_tv.column(c_, width=w_)
+        nb.add(self.tx_tv, text="Transfers")
+        root.rowconfigure(4, weight=1)
+
+        # status bar -------------------------------------------------------
+        self.status = tk.StringVar(value="idle")
+        ttk.Label(root, textvariable=self.status, relief="sunken", anchor="w",
+                  padding=(6, 2)).grid(sticky="ew", padx=10, pady=(0, 8))
+
+        self.refresh()
+        self.refresh_gpu()
+        self.amount_hint()
+        root.after(500, self.poll)
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+
+    # -- network mode (shared chain via gateway) ---------------------------
+    def gw_rpc(self, obj, timeout=15):
+        import socket
+        from net import send_msg, recv_msg
+        if self.gw.get("tls"):
+            from net import tls_connect
+            s = tls_connect(self.gw["host"], self.gw["port"], self.gw["pin"], timeout)
+        else:
+            s = socket.create_connection((self.gw["host"], self.gw["port"]), timeout=timeout)
+        with s, s.makefile("rwb") as f:
+            send_msg(f, obj)
+            return recv_msg(f)
+
+    def gw_ots(self, addr: str) -> int:
+        return int(self.gw_rpc({"op": "next_ots", "miner_id": addr})["ots"])
+
+    def _backend(self):
+        if BACKENDS[self.backend.get()] == "gpu" and gpu_alive():
+            from miner import LlamaCppBackend
+            return LlamaCppBackend(), "gemma-4-12B-Q4", 0.05
+        return MockBackend("good"), "mock-7b", 0.02
+
+    def net_miner(self):
+        mid = self.mid.get().strip() or self.key["addr"]
+        be, model, price = self._backend()
+        if self.gw.get("tls"):
+            from net import WANMiner
+            return WANMiner(self.key, be, self.gw["host"], self.gw["port"], self.gw["pin"],
+                            model, price), "wan"
+        from net import MinerClient
+        return MinerClient(mid, be, self.gw["host"], self.gw["port"], model, price), "plain"
+
+    # -- actions (main thread) -------------------------------------------
+    def miner(self):
+        mid = self.mid.get().strip() or self.key["addr"]
+        be, model, price = self._backend()
+        if BACKENDS[self.backend.get()] == "gpu" and model == "mock-7b":
+            self.say("GPU server down at 19091 — mining mock instead.", "bad")
+        return Miner(mid, be, model, price)
+
+    def copy_addr(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.mid.get())
+        self.say("Address copied to clipboard.")
+
+    def refresh_gpu(self):
+        alive = gpu_alive()
+        self.gpu_txt.set("gpu: online" if alive else "gpu: offline")
+        return alive
+
+    def ensure_registered(self):
+        try:
+            import pq as _pq
+            self.gw_rpc({"op": "register_pq", "addr": self.key["addr"],
+                         "root_hex": _pq.root_of(bytes.fromhex(self.key["seed"])).hex()})
+        except (ConnectionError, OSError, ValueError, KeyError):
+            pass
+
+    def faucet(self):
+        if self.gw:
+            self.say(f"No local faucet in network mode — ask the gateway op to run:\ntestnet_faucet.py {self.mid.get().strip()} 1", "bad")
+            return
+        try:
+            transfer(self.conn, "faucet", self.mid.get().strip(), to_watts(1))
+            self.say("Faucet: +1.000 INFR (test funds).", "good")
+        except ValueError as e:
+            self.say(f"Faucet failed: {e}", "bad")
+        self.refresh()
+
+    def send(self):
+        try:
+            amount = int(self.amount.get())
+        except ValueError:
+            self.say("Send failed: amount must be integer watts.", "bad")
+            return
+        frm, to = self.mid.get().strip(), self.to_id.get().strip()
+        if not to:
+            self.say("Send failed: recipient empty.", "bad")
+            return
+        if frm != self.key["addr"]:
+            self.say("Send failed: active id is not this wallet's PQ key.", "bad")
+            return
+        if not messagebox.askyesno("Confirm send", f"Send {fmt_watts(amount)} to\n{to}?"):
+            return
+        if self.gw:
+            try:
+                self.ensure_registered()
+                pkg = pq.sign(self.key["seed"], self.gw_ots(frm), frm, to, amount)
+                tx = {"type": "transfer", "from": frm, "to": to, "amount": amount, "sig": pkg}
+                r = self.gw_rpc({"op": "submit_tx", "tx": tx})
+                self.say(f"Network send: {r.get('msg', r)} (confirms in next block).",
+                         "good" if r.get("ok") else "bad")
+            except (ValueError, OSError) as e:
+                self.say(f"Send failed: {e}", "bad")
+            self.refresh()
+            return
+        try:
+            pkg = pq.sign(self.key["seed"], next_ots(self.conn, frm), frm, to, amount)
+            transfer(self.conn, frm, to, amount, pkg)
+            try:
+                import gossip
+                gossip.broadcast(frm, pq.root_of(bytes.fromhex(self.key["seed"])).hex(),
+                                 to, amount, pkg)
+            except OSError as e:
+                self.say(f"Sent locally but broadcast failed: {e}", "bad")
+            self.say(f"Sent {fmt_watts(amount)} to {to[:20]}… (OTS #{pkg['ots']}).", "good")
+        except (ValueError, sqlite3.Error) as e:
+            self.say(f"Send failed: {e}", "bad")
+        self.refresh()
+
+    def amount_hint(self):
+        try:
+            self.amt_hint.set(f"= {to_infr(int(self.amount.get())):.6f} {TICKER}")
+        except ValueError:
+            self.amt_hint.set("")
+
+    def toggle_mine(self):
+        if self.mining.is_set():
+            self.stop()
+        else:
+            self.start()
+
+    def start(self):
+        if self.mining.is_set():
+            return
+        if self.gw:
+            try:
+                cl, kind = self.net_miner()
+            except (AssertionError, ConnectionError, ValueError, OSError) as e:
+                self.say(f"Gateway connect failed: {e}", "bad")
+                return
+            self.ensure_registered()
+            self.mining.set()
+            threading.Thread(target=self.net_loop, args=(cl,), daemon=True).start()
+            self.mine_btn.configure(text="⏸ Stop mining")
+            self.spin.grid(row=0, column=6, padx=4)
+            self.spin.start(30)
+            self.status.set(f"mining {self._mode} ({kind})")
+            self.say(f"Mining {self._mode} ({kind}).")
+            return
+        m = self.miner()
+        if m is None:
+            return
+        register_miner(self.conn, m.mid, m.model, m.price)
+        self.mining.set()
+        threading.Thread(target=self.loop, args=(m,), daemon=True).start()
+        self.mine_btn.configure(text="⏸ Stop mining")
+        self.spin.grid(row=0, column=6, padx=4)
+        self.spin.start(30)
+        self.status.set(f"mining as {m.mid[:16]}… ({m.model})")
+        self.say(f"Mining as {m.mid[:16]}… ({m.model}).")
+
+    def stop(self):
+        self.mining.clear()
+        self.say("Miner stopping…")
+
+    def show_board(self):
+        self.say("--- leaderboard ---")
+        for mid, n, psd, pay, avg in leaderboard(self.conn)[:8]:
+            self.say(f"{mid[:20]}… jobs={n} pass={psd} earned={fmt_watts(pay or 0)}")
+
+    def verify_me(self):
+        from verify import CapabilityProfile
+        m = self.miner()
+        if m is None:
+            return
+        self.say("Spot-checking own backend on fresh canaries…")
+        def run():
+            try:
+                p = CapabilityProfile()
+                p.register("tmp", m.backend, seed="wallet-calib")
+                ok, dist, vec = p.spot_check("tmp", m.backend, seed="wallet-check")
+                self.events.put(("info", f"profile {tuple(round(x, 2) for x in vec)} "
+                                 f"dist={dist:.2f} -> "
+                                 f"{'HEALTHY' if ok else 'FAILING — do not mine with this backend'}"))
+            except Exception as e:
+                self.events.put(("info", f"verify error: {e}"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def rotate(self):
+        """OTS keys are single-use (256/wallet). Rotation moves the full
+        balance to a fresh key before exhaustion bricks the wallet."""
+        if not messagebox.askyesno("Rotate key", "Move full balance to a fresh PQ key?\nOld key is archived."):
+            return
+        try:
+            old = self.key
+            bal = balance_watts(self.conn, old["addr"])
+            new = pq.generate()
+            register_pq(self.conn, new["addr"], pq.root_of(bytes.fromhex(new["seed"])).hex())
+            if bal > 0:
+                pkg = pq.sign(old["seed"], next_ots(self.conn, old["addr"]), old["addr"], new["addr"], bal)
+                transfer(self.conn, old["addr"], new["addr"], bal, pkg)
+            arch = os.path.join(os.path.dirname(__file__), f"wallet-pq.old-{old['addr'][:10]}.json")
+            with open(arch, "w") as f:
+                json.dump(old, f)
+            os.chmod(arch, 0o600)
+            save_key(new, self._pw, self.keyfile)
+            self.key = new
+            self.mid.set(new["addr"])
+            self.say(f"Rotated: {fmt_watts(bal)} moved to {new['addr'][:16]}…", "good")
+        except (ValueError, sqlite3.Error, OSError) as e:
+            self.say(f"Rotate failed: {e}", "bad")
+        self.refresh()
+
+    def backup(self):
+        top = tk.Toplevel(self.root)
+        top.title("Seed backup (TESTNET ONLY)")
+        tk.Label(top, text="Anyone with this seed spends your funds. Never share it.",
+                 fg="red").pack(padx=10, pady=4)
+        t = tk.Text(top, height=3, width=70, font=("TkFixedFont", 9))
+        t.pack(padx=10, pady=4)
+        t.insert("end", self.key["seed"])
+        t.configure(state="disabled")
+
+    # -- mining loop (worker thread; DB via own connection) ----------------
+    def loop(self, miner):
+        conn = connect(self.db_path)
+        tasks = list(TASKS)
+        while self.mining.is_set():
+            try:
+                ok, s, pay, lat, _ = dispatch(conn, miner, random.choice(tasks), False)
+                self.session_jobs += 1
+                self.session_earned += pay
+                self.events.put(("job", f"job {self.session_jobs}: pass={int(ok)} "
+                                 f"+{fmt_watts(pay)} ({lat:.0f}ms)"))
+            except Exception as e:
+                self.events.put(("job", f"job error: {e}"))
+                break
+        conn.close()
+        self.events.put(("state", "miner stopped."))
+
+    def net_loop(self, cl):
+        try:
+            while self.mining.is_set():
+                try:
+                    task, res = cl.run_job()
+                except (ConnectionError, OSError, ValueError) as e:
+                    self.events.put(("job", f"net error: {e}"))
+                    break
+                if res.get("ok") is False:
+                    self.events.put(("job", f"rejected: {res.get('msg')}"))
+                    break
+                self.session_jobs += 1
+                pay = res.get("payout_watts", 0)
+                self.session_earned += pay
+                conf = "" if res.get("confirmed", True) else " (unconfirmed)"
+                self.events.put(("job", f"job {self.session_jobs}: {task} pass={int(res.get('passed', 0))} "
+                                 f"+{fmt_watts(pay)}{conf}"))
+        finally:
+            try:
+                cl.close()
+            except Exception:
+                pass
+            self.events.put(("state", "miner stopped."))
+
+    # -- ui plumbing -------------------------------------------------------
+    def say(self, msg, tag=None):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n", tag or ())
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def poll(self):
+        if not self.gw:
+            try:
+                import gossip
+                n = gossip.collect(self.conn, {self.mid.get().strip(), self.key["addr"]})
+                if n:
+                    self.say(f"Collected {n} incoming transfer(s).", "good")
+            except OSError:
+                pass
+        try:
+            while True:
+                kind, msg = self.events.get_nowait()
+                self.say(msg, "good" if kind == "job" and "pass=1" in msg
+                         else "bad" if "pass=0" in msg or "fail" in msg.lower() or "error" in msg.lower()
+                         else None)
+                self.refresh_tabs()
+                self.refresh()
+        except queue.Empty:
+            pass
+        self.refresh()
+        self.root.after(500, self.poll)
+
+    def refresh_tabs(self):
+        mid = self.mid.get().strip()
+        for tv in (self.jobs_tv, self.tx_tv):
+            for i in tv.get_children():
+                tv.delete(i)
+        if self.gw:
+            try:
+                r = self.gw_rpc({"op": "history", "addr": mid, "limit": 30})
+            except (ConnectionError, OSError, ValueError):
+                return
+            for jid, passed, pay in sorted(r.get("jobs", []), reverse=True)[:30]:
+                self.jobs_tv.insert("", "end", values=(f"#{jid}", "pass" if passed else "fail",
+                                                      fmt_watts(pay or 0), ""))
+            for frm, to, amt in r.get("transfers", [])[:30]:
+                d = "in" if to == mid else "out"
+                peer = frm if d == "in" else to
+                self.tx_tv.insert("", "end", values=(d, (peer or "")[:34], fmt_watts(amt)))
+            return
+        try:
+            for jid, passed, pay in self.conn.execute(
+                    "SELECT id, passed, payout_watts FROM jobs WHERE miner_id=? ORDER BY id DESC LIMIT 30",
+                    (mid,)):
+                self.jobs_tv.insert("", 0, values=(f"#{jid}", "pass" if passed else "fail",
+                                                  fmt_watts(pay or 0), ""))
+            for frm, to, amt in self.conn.execute(
+                    "SELECT from_id, to_id, amount_watts FROM transfers "
+                    "WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT 30", (mid, mid)):
+                d = "in" if to == mid else "out"
+                peer = frm if d == "in" else to
+                self.tx_tv.insert("", 0, values=(d, (peer or "")[:34], fmt_watts(amt)))
+        except sqlite3.Error:
+            pass
+
+    def refresh(self):
+        try:
+            if self.gw:
+                try:
+                    b = int(self.gw_rpc({"op": "balance", "addr": self.mid.get().strip()})["balance_watts"])
+                except (ConnectionError, OSError, ValueError, KeyError):
+                    b = None
+                if b is None:
+                    self.status.set(f"{self._mode} — unreachable")
+                    return
+                left = "?"
+                try:
+                    left = pq.NKEYS - self.gw_ots(self.mid.get().strip())
+                except (ConnectionError, OSError, ValueError, KeyError):
+                    pass
+                self.bal.set(f"{fmt_watts(b)}")
+                self.ots_txt.set(f"{left}/{pq.NKEYS} left" if isinstance(left, int) else "sigs: ?")
+                if isinstance(left, int):
+                    self.ots_bar.configure(value=left)
+            else:
+                b = balance_watts(self.conn, self.mid.get().strip())
+                left = pq.NKEYS - next_ots(self.conn, self.mid.get().strip())
+                self.bal.set(f"{fmt_watts(b)}")
+                self.ots_bar.configure(value=left)
+                self.ots_txt.set(f"{left}/{pq.NKEYS} left")
+            self.refresh_tabs()
+            if not self.mining.is_set():
+                self.status.set(f"idle — session: {self.session_jobs} jobs, +{fmt_watts(self.session_earned)}")
+                self.mine_btn.configure(text="▶ Start mining")
+                try:
+                    self.spin.stop()
+                    self.spin.grid_remove()
+                except Exception:
+                    pass
+            else:
+                self.status.set(f"mining — session: {self.session_jobs} jobs, +{fmt_watts(self.session_earned)}")
+        except sqlite3.Error:
+            pass
+
+    def quit(self):
+        self.mining.clear()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    import argparse as _ap
+    _p = _ap.ArgumentParser()
+    _p.add_argument("--profile", default="default")
+    _p.add_argument("--gateway", default="", help="host:port of testnet gateway (network mode)")
+    _p.add_argument("--pin", default="", help="gateway TLS cert pin")
+    _p.add_argument("--no-tls", action="store_true", help="plaintext gateway (loopback tests)")
+    _a = _p.parse_args()
+    _profile = _a.profile
+    _gw = None
+    if _a.gateway:
+        _h, _pt = _a.gateway.rsplit(":", 1)
+        _gw = {"host": _h, "port": int(_pt), "pin": _a.pin, "tls": not _a.no_tls}
+        if _gw["tls"] and not _gw["pin"]:
+            raise SystemExit("--pin required for TLS gateway")
+    import fcntl
+    lockf = open(f"/tmp/opencode/infer-wallet-{_profile}.lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        import subprocess as _sp
+        _sp.run(["notify-send", "Infer Wallet", f"profile '{_profile}' already running"],
+                capture_output=True)
+        raise SystemExit("wallet profile already running")
+    r = tk.Tk()
+    Wallet(r, _profile, _gw)
+    r.mainloop()

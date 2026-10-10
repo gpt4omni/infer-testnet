@@ -90,8 +90,9 @@ class GatewayServer:
             return None
         return json.loads(line.decode())
 
-    def _throttle(self, ip: str, limit=30, window=60) -> bool:
-        """Sliding-window per-IP cap on expensive ops. False = over limit."""
+    def _throttle(self, ip: str, limit=300, window=60) -> bool:
+        """Sliding-window per-IP cap. 300/min lets honest miners burst;
+        garbage still earns nothing (scoring pays 0) and blocks cap space."""
         import collections
         import time as _t
         now = _t.time()
@@ -124,7 +125,8 @@ class GatewayServer:
                 hello = self._recv_or_http(f)
                 if hello is None:  # was an HTTP healthcheck; answered already
                     return
-                if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool"):
+                if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
+                                        "balance", "history", "next_ots", "register_pq", "submit_tx"):
                     self.handle_wan(f, hello, ip)  # one-shot WAN ops, no session needed
                     return
                 if hello.get("op") == "register_pq":
@@ -139,9 +141,6 @@ class GatewayServer:
                 while True:
                     req = recv_msg(f)
                     if req.get("op") == "get_job":
-                        if not self._throttle(ip):
-                            send_msg(f, {"ok": False, "msg": "rate limited, slow down"})
-                            return
                         with self.lock:
                             self.seq += 1
                             task = self.tasks[self.seq % len(self.tasks)]
@@ -205,6 +204,22 @@ class GatewayServer:
             with self.lock:
                 send_msg(f, {"queued": len(self.mempool), "tip": self.chain.tip,
                              "height": self.chain.height})
+            return True
+        if op == "balance":
+            from ledger import balance_watts
+            with self.lock:
+                send_msg(f, {"balance_watts": balance_watts(self.conn, req.get("addr", ""))})
+            return True
+        if op == "history":
+            addr, lim = req.get("addr", ""), min(int(req.get("limit", 30)), 100)
+            with self.lock:
+                jobs = self.conn.execute(
+                    "SELECT id, passed, payout_watts FROM jobs WHERE miner_id=? "
+                    "ORDER BY id DESC LIMIT ?", (addr, lim)).fetchall()
+                txs = self.conn.execute(
+                    "SELECT from_id, to_id, amount_watts FROM transfers "
+                    "WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT ?", (addr, addr, lim)).fetchall()
+            send_msg(f, {"jobs": jobs, "transfers": txs})
             return True
         if op == "get_tip":
             send_msg(f, {"tip": self.chain.tip, "height": self.chain.height})
@@ -335,7 +350,7 @@ class GatewayServer:
             txs = [{"type": "mint", "from": "subsidy", "to": self.reward_addr,
                     "amount": self.block_reward}] + txs
         if not tip:
-            blk = mine_block("00" * 32, 0, self.bits, txs)
+            blk = mine_block("00" * 32, 0, self.bits, [])  # genesis carries no user txs
         else:
             with self.lock:
                 bits = retarget(self.chain.path_to(tip)) or self.bits
@@ -359,19 +374,21 @@ class GatewayServer:
         if new_tip == self.applied_tip:
             return
         fwd, b = [], new_tip
-        while b and b != self.applied_tip:
+        while b and b != self.applied_tip and set(b) != {"0"}:
             blk = self.chain.blocks.get(b)
             if blk is None:
                 break
             fwd.append(blk)
-            b = blk["header"]["prev_hash"] if blk["header"]["height"] else ""
-        if b == self.applied_tip and self.applied_tip:
+            ph = blk["header"]["prev_hash"]
+            b = "" if set(ph) == {"0"} else ph
+        if b == self.applied_tip:
             for blk in reversed(fwd):
                 for t in blk["txs"]:
                     apply_tx(self.conn, t)
         else:
             miners = list(self.conn.execute("SELECT * FROM miners"))
             accounts = list(self.conn.execute("SELECT * FROM pq_accounts"))
+            issued = list(self.conn.execute("SELECT * FROM transfers WHERE from_id IN ('faucet','subsidy')"))
             self.conn.execute("DELETE FROM jobs")
             self.conn.execute("DELETE FROM transfers")
             self.conn.execute("DELETE FROM slashes")
@@ -380,6 +397,8 @@ class GatewayServer:
                 self.conn.execute("INSERT OR REPLACE INTO miners VALUES(?,?,?,?,?)", tuple(m))
             for a_ in accounts:
                 self.conn.execute("INSERT OR REPLACE INTO pq_accounts VALUES(?,?)", tuple(a_))
+            for row in issued:  # protocol issuance survives reorgs (faucet/subsidy aren't user spends)
+                self.conn.execute("INSERT OR IGNORE INTO transfers VALUES(?,?,?,?,?,?,?)", tuple(row))
             self.conn.commit()
             for blk in self.chain.path_to(new_tip):
                 for t in blk["txs"]:
@@ -412,6 +431,8 @@ class MinerClient:
         import time
         send_msg(self.f, {"op": "get_job"})
         job = recv_msg(self.f)
+        if "task" not in job:
+            raise ConnectionError(job.get("msg", "get_job rejected"))
         t0 = time.time()
         code, _ = self.backend.generate(job["task"])
         lat = (time.time() - t0) * 1000
@@ -424,6 +445,10 @@ class MinerClient:
             self.f.close()
         finally:
             self.sock.close()
+
+
+# ---------------------------------------------------------------------------
+# WAN layer: TLS with cert pinning (TOFU) + PQ-signed submits.
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +542,8 @@ class WANMiner:
         from miner import sha
         send_msg(self.f, {"op": "get_job"})
         job = recv_msg(self.f)
+        if "task" not in job:
+            raise ConnectionError(job.get("msg", "get_job rejected"))
         t0 = time.time()
         code, _ = self.backend.generate(job["task"])
         lat = (time.time() - t0) * 1000
