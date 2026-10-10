@@ -148,6 +148,12 @@ class GatewayServer:
         self.hits = {}  # ip -> deque of recent expensive-op timestamps
         self.challenges = {}  # challenge_id -> (challenge, expiry)
         self.checkpoint_doc = None
+        import collections as _c
+        self.infer_q = _c.deque()  # open-prompt jobs awaiting a miner
+        self.infer_results = {}  # job_id -> {status, output, miner, ms, customer}
+        self.infer_prompts = {}  # job_id -> prompt (scoring context after serve)
+        self.infer_seq = 0
+        self.miner_stats = {}  # miner_id -> [accepted, total] (customer feedback)
         try:
             self.chain = load_chain(chain_path)
         except ValueError as e:
@@ -484,7 +490,8 @@ class GatewayServer:
                     return
                 if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
                                         "balance", "history", "next_ots", "register_pq", "submit_tx",
-                                        "template", "get_mempool"):
+                                        "template", "get_mempool", "infer_submit", "infer_result",
+                                        "feedback"):
                     self.handle_wan(f, hello, ip)  # one-shot WAN ops, no session needed
                     return
                 if hello.get("op") == "register_pq":
@@ -496,14 +503,22 @@ class GatewayServer:
                     register_miner(self.conn, hello["miner_id"], hello.get("model", "?"),
                                    float(hello.get("price", 0)))
                 send_msg(f, {"ok": True, "msg": "registered"})
+                infer_ok = bool(hello.get("infer"))  # new clients also take open prompts
                 while True:
                     req = recv_msg(f)
                     if req.get("op") == "get_job":
                         with self.lock:
-                            self.seq += 1
-                            task = self.tasks[self.seq % len(self.tasks)]
-                            jid = f"p2p-{self.seq}"
-                        send_msg(f, {"job_id": jid, "task": task, "is_eval": False})
+                            ij = self.infer_q.popleft() if (infer_ok and self.infer_q) else None
+                            if ij is None:
+                                self.seq += 1
+                                task = self.tasks[self.seq % len(self.tasks)]
+                                jid = f"p2p-{self.seq}"
+                        if ij is not None:
+                            send_msg(f, {"kind": "infer", "job_id": ij["job_id"],
+                                         "prompt": ij["prompt"], "max_tokens": ij["max_tokens"],
+                                         "customer": ij["customer"]})
+                            continue
+                        send_msg(f, {"kind": "task", "job_id": jid, "task": task, "is_eval": False})
                     elif req.get("op") == "submit":
                         if not self._throttle(ip):
                             send_msg(f, {"ok": False, "msg": "rate limited, slow down"})
@@ -572,8 +587,63 @@ class GatewayServer:
         if op == "get_mempool":
             from chain import MAX_BLOCK_REWARD_WATTS
             with self.lock:
-                send_msg(f, {"tip": self.chain.tip, "height": self.chain.height,
+                send_msg(f, {"queued": len(self.mempool), "tip": self.chain.tip,
+                             "height": self.chain.height,
                              "txs": self.mempool[:200], "cap_watts": MAX_BLOCK_REWARD_WATTS})
+            return True
+        if op == "infer_submit":
+            prompt = str(req.get("prompt", ""))[:4000]
+            max_tok = max(16, min(int(req.get("max_tokens", 256)), 1024))
+            if not prompt.strip():
+                send_msg(f, {"ok": False, "msg": "empty prompt"})
+                return True
+            with self.lock:
+                rows = self.conn.execute("SELECT MIN(price_per_1k) FROM miners").fetchone()
+                floor = rows[0] if rows and rows[0] else 0.005
+                quote = max(100, int((len(prompt) // 4 + max_tok) / 1000 * floor * 1000000))
+                self.infer_seq += 1
+                jid = f"inf-{self.infer_seq}"
+                self.infer_q.append({"job_id": jid, "prompt": prompt, "max_tokens": max_tok,
+                                     "customer": req.get("customer", ""), "quoted_watts": quote})
+                self.infer_prompts[jid] = prompt
+            send_msg(f, {"ok": True, "job_id": jid, "quoted_watts": quote})
+            return True
+        if op == "infer_result":
+            with self.lock:
+                r = self.infer_results.get(req.get("job_id", ""))
+            send_msg(f, dict({"ok": r is not None}, **(r or {})))
+            return True
+        if op == "submit_infer":
+            with self.lock:
+                self.infer_results[req["job_id"]] = {
+                    "status": "done", "output": str(req.get("output", ""))[:8000],
+                    "miner": req.get("miner_id", ""), "ms": float(req.get("latency_ms", 0))}
+                st = self.miner_stats.setdefault(req.get("miner_id", ""), [0, 0])
+                st[1] += 1
+            send_msg(f, {"ok": True})
+            # d1 quality score: best-effort, never blocks payment. Ground truth
+            # (unit tests) and customer feedback still rule; this prices the
+            # subjective remainder and feeds capability profiles.
+            try:
+                from judge import DJudge
+                with self.lock:
+                    ctx = self.infer_prompts.get(req["job_id"], "general inference")
+                q = DJudge(timeout=30).quality(ctx, str(req.get("output", ""))[:2000])
+            except Exception:
+                q = None
+            if q is not None:
+                with self.lock:
+                    if req["job_id"] in self.infer_results:
+                        self.infer_results[req["job_id"]]["d1_quality"] = round(q, 3)
+            return True
+        if op == "feedback":
+            with self.lock:
+                st = self.miner_stats.setdefault(req.get("miner_id", ""), [0, 0])
+                if req.get("accept"):
+                    st[0] += 1
+                st[1] = max(st[1], 1)
+                acc = st[0] / st[1]
+            send_msg(f, {"ok": True, "accept_rate": acc})
             return True
         if op == "template":
             from chain import retarget
@@ -850,11 +920,14 @@ class GatewayServer:
 
 class MinerClient:
     def __init__(self, miner_id, backend, host="127.0.0.1", port=19191,
-                 model="?", price=0.0):
+                 model="?", price=0.0, infer=False):
         self.sock = socket.create_connection((host, port), timeout=10)
         self.f = self.sock.makefile("rwb")
         self.miner_id, self.backend = miner_id, backend
-        send_msg(self.f, {"op": "register", "miner_id": miner_id, "model": model, "price": price})
+        reg = {"op": "register", "miner_id": miner_id, "model": model, "price": price}
+        if infer:
+            reg["infer"] = True
+        send_msg(self.f, reg)
         r = recv_msg(self.f)
         assert r.get("ok"), r
 
@@ -870,6 +943,27 @@ class MinerClient:
         send_msg(self.f, {"op": "submit", "job_id": job["job_id"], "miner_id": self.miner_id,
                           "task": job["task"], "code": code, "latency_ms": lat})
         return job["task"], recv_msg(self.f)
+
+    def run_mixed_once(self):
+        """One unit of work: open-prompt inference if offered, else a task."""
+        import time
+        send_msg(self.f, {"op": "get_job"})
+        job = recv_msg(self.f)
+        if job.get("kind") == "infer":
+            t0 = time.time()
+            out, _ = self.backend.generate_raw(job["prompt"], job.get("max_tokens", 256))
+            lat = (time.time() - t0) * 1000
+            send_msg(self.f, {"op": "submit_infer", "job_id": job["job_id"],
+                              "miner_id": self.miner_id, "output": out, "latency_ms": lat})
+            return ("infer", job["job_id"], recv_msg(self.f))
+        if "task" not in job:
+            raise ConnectionError(job.get("msg", "get_job rejected"))
+        t0 = time.time()
+        code, _ = self.backend.generate(job["task"])
+        lat = (time.time() - t0) * 1000
+        send_msg(self.f, {"op": "submit", "job_id": job["job_id"], "miner_id": self.miner_id,
+                          "task": job["task"], "code": code, "latency_ms": lat})
+        return ("task", job["task"], recv_msg(self.f))
 
     def close(self):
         try:
@@ -948,7 +1042,7 @@ def tls_connect(host: str, port: int, pin: str, timeout=15):
 class WANMiner:
     """WAN client: pinned-TLS transport + PQ-signed submits."""
 
-    def __init__(self, key: dict, backend, host, port, pin, model="?", price=0.0):
+    def __init__(self, key: dict, backend, host, port, pin, model="?", price=0.0, infer=False):
         import pq
         self.key, self.backend = key, backend
         self.mid = key["addr"]
@@ -959,9 +1053,38 @@ class WANMiner:
                           "root_hex": pq.root_of(bytes.fromhex(key["seed"])).hex()})
         r = recv_msg(self.f)
         assert r.get("ok"), r
-        send_msg(self.f, {"op": "register", "miner_id": self.mid, "model": model, "price": price})
+        reg = {"op": "register", "miner_id": self.mid, "model": model, "price": price}
+        if infer:
+            reg["infer"] = True
+        send_msg(self.f, reg)
         r = recv_msg(self.f)
         assert r.get("ok"), r
+
+    def run_mixed_once(self):
+        """Same dual protocol as MinerClient: infer jobs or signed tasks."""
+        import time
+        import pq
+        from miner import sha
+        send_msg(self.f, {"op": "get_job"})
+        job = recv_msg(self.f)
+        if job.get("kind") == "infer":
+            t0 = time.time()
+            out, _ = self.backend.generate_raw(job["prompt"], job.get("max_tokens", 256))
+            lat = (time.time() - t0) * 1000
+            send_msg(self.f, {"op": "submit_infer", "job_id": job["job_id"],
+                              "miner_id": self.mid, "output": out, "latency_ms": lat})
+            return ("infer", job["job_id"], recv_msg(self.f))
+        if "task" not in job:
+            raise ConnectionError(job.get("msg", "get_job rejected"))
+        t0 = time.time()
+        code, _ = self.backend.generate(job["task"])
+        lat = (time.time() - t0) * 1000
+        ots = self._fresh_ots()
+        msg = f"submit:{job['job_id']}:{sha(code)}"
+        pkg = pq.sign(self.key["seed"], ots, self.mid, msg, len(code))
+        send_msg(self.f, {"op": "submit_signed", "job_id": job["job_id"], "miner_id": self.mid,
+                          "task": job["task"], "code": code, "latency_ms": lat, "sig_pkg": pkg})
+        return ("task", job["task"], recv_msg(self.f))
 
     def _fresh_ots(self):
         send_msg(self.f, {"op": "next_ots", "miner_id": self.mid})

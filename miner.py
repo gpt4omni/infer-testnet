@@ -25,6 +25,15 @@ class MockBackend:
             out = "def solve(x):\n    return 42  # cheap garbage\n"
         return out, (time.time() - t0) * 1000
 
+    def generate_raw(self, prompt: str, max_tokens: int = 256) -> tuple[str, float]:
+        t0 = time.time()
+        time.sleep(0.02 if self.personality == "good" else 0.002)
+        if self.personality == "good":
+            out = f"mock answer ({len(prompt)} chars in): {prompt[:200]}"
+        else:
+            out = "garbage garbage garbage"
+        return out, (time.time() - t0) * 1000
+
 
 GOOD_FIXTURES = {
     "add": "def solve(a, b):\n    return a + b\n",
@@ -77,6 +86,22 @@ class LlamaCppBackend:
             txt = msg["reasoning_content"]  # reasoning model: answer stuck in thinking trace
         code = extract_code(txt)
         return code, (time.time() - t0) * 1000
+
+    def generate_raw(self, prompt: str, max_tokens: int = 256) -> tuple[str, float]:
+        """Open-ended inference: prompt goes through untouched (no code framing)."""
+        t0 = time.time()
+        body = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7, "max_tokens": max(16, min(max_tokens, 1024))}).encode()
+        req = urllib.request.Request(self.url, data=body,
+                                     headers={"Content-Type": "application/json",
+                                              **({"Authorization": f"Bearer {self.api_key}"}
+                                                 if self.api_key else {})})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            msg = json.load(r)["choices"][0]["message"]
+        txt = (msg.get("content") or "") or (msg.get("reasoning_content") or "")
+        return txt.strip()[:8000], (time.time() - t0) * 1000
 
 
 def extract_code(txt: str) -> str:
