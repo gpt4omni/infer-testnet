@@ -75,6 +75,21 @@ class GatewayServer:
             self.ctx.load_cert_chain(cert_path, key_path)
             print(f"TLS on, cert fingerprint (pin): {fp}", flush=True)
 
+    def _recv_or_http(self, f):
+        """Read one frame; answer HTTP healthchecks (Railway edge, uptime
+        monitors) with 200 OK instead of dropping them. Returns None if it
+        was HTTP, else the parsed JSON message."""
+        line = f.readline(RECV_LIMIT)
+        if not line:
+            raise ConnectionError("peer closed")
+        if line[:3] in (b"GET", b"HEA", b"POS", b"OPT"):
+            body = b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}'
+            f.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+            f.flush()
+            return None
+        return json.loads(line.decode())
+
     def _throttle(self, ip: str, limit=30, window=60) -> bool:
         """Sliding-window per-IP cap on expensive ops. False = over limit."""
         import collections
@@ -106,7 +121,9 @@ class GatewayServer:
         from ledger import log_job, register_miner
         try:
             with cs, cs.makefile("rwb") as f:
-                hello = recv_msg(f)
+                hello = self._recv_or_http(f)
+                if hello is None:  # was an HTTP healthcheck; answered already
+                    return
                 if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool"):
                     self.handle_wan(f, hello, ip)  # one-shot WAN ops, no session needed
                     return
