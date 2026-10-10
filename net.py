@@ -590,32 +590,32 @@ class GatewayServer:
                     elif req.get("op") == "submit":
                         if not self._throttle(ip):
                             send_msg(f, {"ok": False, "msg": "rate limited, slow down"})
-                            return
-                        t = TASKS[req["task"]]
-                        passed = check(req["code"], t["tests"])
-                        tokens = max(1, len(req["code"]) // 4)
-                        with self.lock:
-                            m = self.conn.execute(
-                                "SELECT price_per_1k FROM miners WHERE id=?",
-                                (req["miner_id"],)).fetchone()
-                        s, pay = score_job(passed, tokens, (m[0] if m else 0.02),
-                                           float(req.get("latency_ms", 0)))
-                        if not passed:
-                            pay = 0
-                        job_tx = {"type": "job", "miner": req["miner_id"], "ph": sha(t["prompt"]),
-                                  "oh": sha(req["code"]), "tokens": tokens,
-                                  "lat": float(req.get("latency_ms", 0)),
-                                  "eval": False, "passed": passed, "score": s, "pay": pay}
-                        if self.block_mode:
-                            ok, msg = self.mempool_add(job_tx)
-                            send_msg(f, {"passed": passed, "payout_watts": pay,
-                                         "confirmed": False, "mempool": msg})
                         else:
+                            t = TASKS[req["task"]]
+                            passed = check(req["code"], t["tests"])
+                            tokens = max(1, len(req["code"]) // 4)
                             with self.lock:
-                                log_job(self.conn, req["miner_id"], sha(t["prompt"]),
-                                        sha(req["code"]), tokens, float(req.get("latency_ms", 0)),
-                                        False, passed, s, pay)
-                            send_msg(f, {"passed": passed, "payout_watts": pay})
+                                m = self.conn.execute(
+                                    "SELECT price_per_1k FROM miners WHERE id=?",
+                                    (req["miner_id"],)).fetchone()
+                            s, pay = score_job(passed, tokens, (m[0] if m else 0.02),
+                                               float(req.get("latency_ms", 0)))
+                            if not passed:
+                                pay = 0
+                            job_tx = {"type": "job", "miner": req["miner_id"], "ph": sha(t["prompt"]),
+                                      "oh": sha(req["code"]), "tokens": tokens,
+                                      "lat": float(req.get("latency_ms", 0)),
+                                      "eval": False, "passed": passed, "score": s, "pay": pay}
+                            if self.block_mode:
+                                ok, msg = self.mempool_add(job_tx)
+                                send_msg(f, {"passed": passed, "payout_watts": pay,
+                                             "confirmed": False, "mempool": msg})
+                            else:
+                                with self.lock:
+                                    log_job(self.conn, req["miner_id"], sha(t["prompt"]),
+                                            sha(req["code"]), tokens, float(req.get("latency_ms", 0)),
+                                            False, passed, s, pay)
+                                send_msg(f, {"passed": passed, "payout_watts": pay})
                     elif not self.handle_wan(f, req, ip):
                         send_msg(f, {"ok": False, "msg": "unknown op"})
         except (ConnectionError, json.JSONDecodeError, KeyError):
@@ -704,6 +704,9 @@ class GatewayServer:
             except Exception:
                 q = None
             paid = 0
+            note = "judge abstained — no score, no pay"
+            if q is not None and q < self.D1_PAY_THRESHOLD:
+                note = f"d1={q:.2f} below pay line — miner unpaid"
             if q is not None:
                 with self.lock:
                     if req["job_id"] in self.infer_results:
@@ -733,9 +736,14 @@ class GatewayServer:
                         if req["job_id"] in self.infer_results:
                             self.infer_results[req["job_id"]]["paid_watts"] = m_amt
                     paid = m_amt
+                    note = f"auto-paid {m_amt} watts"
+                else:
+                    note = "customer insolvent — fund wallet first (faucet/mining)"
             if paid == 0:
                 with self.lock:
                     self.infer_terms.pop(req["job_id"], None)
+                    if req["job_id"] in self.infer_results:
+                        self.infer_results[req["job_id"]]["pay_note"] = note
             return True
         if op == "feedback":
             with self.lock:
