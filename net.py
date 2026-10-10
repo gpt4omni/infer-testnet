@@ -17,6 +17,47 @@ import threading
 
 RECV_LIMIT = 1 << 20
 
+FAUCET_DIFFICULTY = 5  # leading hex zeros (~1M hashes, a few seconds in-browser)
+FAUCET_AMOUNT = 50_000  # watts = 0.05 INFR per claim, 1 claim/IP/day
+
+FAUCET_HTML = """<!doctype html><html><head><meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Infer Testnet Faucet</title>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:3em auto;padding:0 1em;color:#222}
+input{width:100%;padding:.6em;font-family:monospace}button{padding:.6em 1.2em;margin-top:.6em}
+#log{background:#f4f4f4;padding:.8em;white-space:pre-wrap;min-height:4em}</style></head><body>
+<h1>&#9672; Infer Testnet Faucet</h1>
+<p>Free test INFR. The captcha is proof-of-work: your browser grinds SHA-256
+until the hash has <b>5 leading zeros</b> — bots pay CPU per claim, just like miners.</p>
+<p>Amount: <b>50,000 watts (0.05 INFR)</b> &middot; 1 claim per IP per day &middot; test funds only.</p>
+<input id=addr placeholder="pq1... your wallet address">
+<button id=go>Solve captcha &amp; claim</button>
+<p id=log>idle</p>
+<script>
+const log = m => document.getElementById('log').textContent = m;
+async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');}
+document.getElementById('go').onclick = async () => {
+ const addr = document.getElementById('addr').value.trim();
+ if(!addr.startsWith('pq1')){log('enter a pq1... address from your wallet');return;}
+ log('fetching challenge…');
+ const c = await (await fetch('/api/challenge')).json();
+ log(`grinding ${c.difficulty} zeros (a few seconds)…`);
+ let nonce = 0;
+ for(;;nonce++){
+  if(nonce % 20000 === 0){log(`grinding… ${nonce} hashes`);await new Promise(r=>setTimeout(r));}
+  if((await sha(c.challenge + nonce)).startsWith('0'.repeat(c.difficulty))) break;
+ }
+ log('solved, claiming…');
+ const r = await (await fetch('/api/faucet',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({addr,challenge_id:c.challenge_id,nonce})})).json();
+ log(r.ok ? `paid ${r.amount_watts} watts — mine or send it!` : 'denied: ' + r.msg);
+};
+fetch('/api/status').then(r=>r.json()).then(s=>
+ log(`idle — chain height ${s.height}, ${s.queued} queued`)).catch(()=>{});
+</script></body></html>"""
+
 
 def send_msg(f, obj):
     f.write((json.dumps(obj) + "\n").encode())
@@ -56,6 +97,7 @@ class GatewayServer:
         self.empty_every = empty_every
         self._idle_rounds = 0
         self.hits = {}  # ip -> deque of recent expensive-op timestamps
+        self.challenges = {}  # challenge_id -> (challenge, expiry)
         try:
             self.chain = load_chain(chain_path)
         except ValueError as e:
@@ -75,20 +117,106 @@ class GatewayServer:
             self.ctx.load_cert_chain(cert_path, key_path)
             print(f"TLS on, cert fingerprint (pin): {fp}", flush=True)
 
-    def _recv_or_http(self, f):
-        """Read one frame; answer HTTP healthchecks (Railway edge, uptime
-        monitors) with 200 OK instead of dropping them. Returns None if it
-        was HTTP, else the parsed JSON message."""
+    def _recv_or_http(self, f, ip="local"):
+        """Read one frame; serve HTTP routes (healthcheck, faucet site/API),
+        else return the parsed JSON protocol message (None = HTTP handled)."""
         line = f.readline(RECV_LIMIT)
         if not line:
             raise ConnectionError("peer closed")
-        if line[:3] in (b"GET", b"HEA", b"POS", b"OPT"):
-            body = b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}'
-            f.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-                    + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
-            f.flush()
+        if line[:3] not in (b"GET", b"HEA", b"POS", b"OPT"):
+            return json.loads(line.decode())
+        parts = line.decode(errors="replace").split()
+        method, path = (parts + ["", "/"])[:2]
+        headers, body = {}, b""
+        while True:
+            hl = f.readline(65536)
+            if not hl or hl in (b"\r\n", b"\n"):
+                break
+            if b":" in hl:
+                k, v = hl.decode(errors="replace").split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        if method == "POST":
+            try:
+                body = f.read(int(headers.get("content-length", "0")))
+            except ValueError:
+                pass
+        if path == "/" and method == "GET":
+            self._http(f, 200, FAUCET_HTML.encode(), "text/html; charset=utf-8")
             return None
-        return json.loads(line.decode())
+        if path == "/api/challenge" and method == "GET":
+            import secrets as _s
+            cid = _s.token_hex(8)
+            chal = _s.token_hex(16)
+            with self.lock:
+                self.challenges[cid] = (chal, __import__("time").time() + 600)
+            self._http(f, 200, json.dumps(
+                {"challenge_id": cid, "challenge": chal,
+                 "difficulty": FAUCET_DIFFICULTY, "amount_watts": FAUCET_AMOUNT}).encode(),
+                "application/json")
+            return None
+        if path == "/api/faucet" and method == "POST":
+            xff = headers.get("x-forwarded-for", "")
+            real_ip = xff.split(",")[0].strip() if xff else ip
+            self._faucet_claim(f, real_ip, body)
+            return None
+        if path == "/api/status" and method == "GET":
+            from ledger import subsidy_issued_watts, burned_watts
+            with self.lock:
+                st = {"tip": self.chain.tip, "height": self.chain.height,
+                      "queued": len(self.mempool),
+                      "issued_watts": subsidy_issued_watts(self.conn),
+                      "burned_watts": burned_watts(self.conn)}
+            self._http(f, 200, json.dumps(st).encode(), "application/json")
+            return None
+        self._http(f, 200, b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}',
+                   "application/json")
+        return None
+
+    @staticmethod
+    def _http(f, code, body: bytes, ctype: str):
+        f.write(f"HTTP/1.1 {code} {'OK' if code == 200 else 'ERR'}\r\nContent-Type: {ctype}\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        f.flush()
+
+    def _faucet_claim(self, f, ip, body: bytes):
+        """PoW-captcha drip: 1 claim/IP/day, small amount, all auditable."""
+        import hashlib as _hl
+        import time as _t
+        try:
+            req = json.loads(body.decode() or "{}")
+            addr, cid, nonce = req["addr"], req["challenge_id"], str(req["nonce"])
+        except (ValueError, KeyError):
+            self._http(f, 400, b'{"ok":false,"msg":"bad request"}', "application/json")
+            return
+        if not isinstance(addr, str) or not addr.startswith("pq1") or len(addr) > 64:
+            self._http(f, 400, b'{"ok":false,"msg":"bad address"}', "application/json")
+            return
+        with self.lock:
+            chal = self.challenges.pop(cid, None)
+        if chal is None or _t.time() > chal[1]:
+            self._http(f, 400, b'{"ok":false,"msg":"stale/unknown challenge"}', "application/json")
+            return
+        digest = _hl.sha256((chal[0] + nonce).encode()).hexdigest()
+        if not digest.startswith("0" * FAUCET_DIFFICULTY):
+            self._http(f, 400, b'{"ok":false,"msg":"insufficient work"}', "application/json")
+            return
+        day = int(_t.time() // 86400)
+        with self.lock:
+            self.conn.execute("CREATE TABLE IF NOT EXISTS faucet_claims(ip TEXT, day INTEGER, PRIMARY KEY(ip, day))")
+            if self.conn.execute("SELECT 1 FROM faucet_claims WHERE ip=? AND day=?", (ip, day)).fetchone():
+                self.conn.commit()
+                self._http(f, 429, b'{"ok":false,"msg":"already claimed today"}', "application/json")
+                return
+            from ledger import transfer
+            try:
+                transfer(self.conn, "faucet", addr, FAUCET_AMOUNT)
+            except ValueError as e:
+                self._http(f, 400, json.dumps({"ok": False, "msg": str(e)}).encode(), "application/json")
+                return
+            self.conn.execute("INSERT INTO faucet_claims VALUES(?,?)", (ip, day))
+            self.conn.commit()
+        self._http(f, 200, json.dumps({"ok": True, "amount_watts": FAUCET_AMOUNT}).encode(),
+                   "application/json")
 
     def _throttle(self, ip: str, limit=300, window=60) -> bool:
         """Sliding-window per-IP cap. 300/min lets honest miners burst;
@@ -122,7 +250,7 @@ class GatewayServer:
         from ledger import log_job, register_miner
         try:
             with cs, cs.makefile("rwb") as f:
-                hello = self._recv_or_http(f)
+                hello = self._recv_or_http(f, ip)
                 if hello is None:  # was an HTTP healthcheck; answered already
                     return
                 if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
