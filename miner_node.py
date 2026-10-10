@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--mine", action="store_true",
                     help="produce blocks too (open production): fetch mempool, grind PoW, submit")
     ap.add_argument("--mine-max-blocks", type=int, default=0, help="0 = forever")
+    ap.add_argument("--infer", action="store_true",
+                    help="serve open-prompt inference jobs as well as tasks")
     a = ap.parse_args()
 
     host, port = a.gateway.rsplit(":", 1)
@@ -112,16 +114,22 @@ def main():
         from net import MinerClient
         print("WARNING: plaintext transport (loopback only)", flush=True)
         # plain client has no signed submits; WAN must use TLS+WANMiner
-        cl = MinerClient(key["addr"], be, host, int(port), model, a.price)
+        cl = MinerClient(key["addr"], be, host, int(port), model, a.price, infer=a.infer)
         run = cl.run_job
     else:
         if not a.pin:
             raise SystemExit("--pin required (gateway prints it at startup)")
         from net import WANMiner
-        cl = WANMiner(key, be, host, int(port), a.pin, model, a.price)
+        cl = WANMiner(key, be, host, int(port), a.pin, model, a.price, infer=a.infer)
         run = cl.run_job
 
     earned, n = 0, 0
+    if a.infer:
+        def run():
+            kind, what, res = cl.run_mixed_once()
+            return (f"infer:{what}" if kind == "infer" else what), res
+    else:
+        run = cl.run_job
     try:
         while a.jobs == 0 or n < a.jobs:
             task, res = run()
@@ -130,7 +138,7 @@ def main():
                 break
             earned += res.get("payout_watts", 0)
             n += 1
-            print(f"job {n}: {task} pass={int(res.get('passed', 0))} "
+            print(f"job {n}: {task} pass={int(res.get('passed', 1))} "
                   f"+{fmt_watts(res.get('payout_watts', 0))} total={fmt_watts(earned)}", flush=True)
     finally:
         cl.close()

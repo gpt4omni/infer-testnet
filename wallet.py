@@ -233,6 +233,9 @@ class Wallet:
         btnrow.grid(row=2, column=0, columnspan=2, sticky="w")
         self.pg_ask_btn = ttk.Button(btnrow, text="Ask", command=self.ask_pg)
         self.pg_ask_btn.pack(side="left")
+        self.pg_cancel_btn = ttk.Button(btnrow, text="Cancel", command=self.cancel_pg,
+                                        state="disabled")
+        self.pg_cancel_btn.pack(side="left", padx=6)
         self.pg_pay_btn = ttk.Button(btnrow, text="Accept & pay", command=self.pay_pg, state="disabled")
         self.pg_pay_btn.pack(side="left", padx=6)
         self.pg_meta = tk.StringVar(value="")
@@ -242,6 +245,7 @@ class Wallet:
         self.pg_answer.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=4)
         pg.rowconfigure(3, weight=1)
         self.pg_job = None  # {job_id, miner, quote, output, score}
+        self._pg_cancel = threading.Event()
         root.rowconfigure(4, weight=1)
 
         # status bar -------------------------------------------------------
@@ -505,7 +509,9 @@ class Wallet:
             return
         self.pg_ask_btn.configure(state="disabled")
         self.pg_pay_btn.configure(state="disabled")
+        self.pg_cancel_btn.configure(state="normal")
         self.pg_job = None
+        self._pg_cancel.clear()
         self.pg_show("working…", "contacting miners")
         mid = self.mid.get().strip()
         if self.gw:
@@ -514,6 +520,10 @@ class Wallet:
             m = self.miner()
             threading.Thread(target=self._pg_run_local,
                              args=(prompt, m.backend, m.model), daemon=True).start()
+
+    def cancel_pg(self):
+        self._pg_cancel.set()
+        self.pg_show("cancelling…", "")
 
     def _pg_run(self, prompt, mid):
         try:
@@ -526,6 +536,9 @@ class Wallet:
             import time as _t
             out, miner = None, ""
             for _ in range(40):
+                if self._pg_cancel.is_set():
+                    self.events.put(("pgfail", "cancelled"))
+                    return
                 _t.sleep(3)
                 res = self.gw_rpc({"op": "infer_result", "job_id": jid}, timeout=15)
                 if res.get("ok"):
@@ -674,6 +687,7 @@ class Wallet:
                     out, meta = msg
                     self.pg_show(out, meta)
                     self.pg_ask_btn.configure(state="normal")
+                    self.pg_cancel_btn.configure(state="disabled")
                     if self.pg_job and self.gw:
                         self.pg_pay_btn.configure(state="normal")
                     self.refresh()
@@ -681,6 +695,7 @@ class Wallet:
                 if kind == "pgfail":
                     self.pg_show("", str(msg))
                     self.pg_ask_btn.configure(state="normal")
+                    self.pg_cancel_btn.configure(state="disabled")
                     self.refresh()
                     continue
                 self.say(msg, "good" if kind == "job" and "pass=1" in msg
