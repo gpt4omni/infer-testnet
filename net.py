@@ -323,6 +323,12 @@ class GatewayServer:
         if op == "next_ots":
             with self.lock:
                 n = next_ots(self.conn, req["miner_id"])
+                for m in self.mempool:  # unconfirmed spends reserve their index too
+                    if m.get("from") == req["miner_id"]:
+                        try:
+                            n = max(n, int(m["sig"]["ots"]) + 1)
+                        except (KeyError, TypeError, ValueError):
+                            pass
             send_msg(f, {"ots": n})
             return True
         if op == "peers":
@@ -454,6 +460,21 @@ class GatewayServer:
                 return False, "unknown PQ sender"
             if not pq.verify(tx["from"], row[0], tx["sig"], tx["to"], tx["amount"]):
                 return False, "bad PQ signature"
+            try:
+                ots = int(tx["sig"]["ots"])
+            except (KeyError, TypeError, ValueError):
+                return False, "bad OTS index"
+            with self.lock:
+                used = self.conn.execute(
+                    "SELECT 1 FROM transfers WHERE from_id=? AND ots=?", (tx["from"], ots)).fetchone()
+                if not used and self._has_ots():
+                    used = self.conn.execute(
+                        "SELECT 1 FROM ots_used WHERE addr=? AND ots=?", (tx["from"], ots)).fetchone()
+                if not used:
+                    used = any(m.get("from") == tx["from"] and
+                               int(m.get("sig", {}).get("ots", -1)) == ots for m in self.mempool)
+                if used:
+                    return False, f"OTS #{ots} already spent or queued — wallet must use a fresh index"
         elif tx.get("type") not in ("job",):
             return False, "only transfer/job relayed (mint/slash are protocol)"
         with self.lock:
@@ -497,7 +518,8 @@ class GatewayServer:
 
     def apply_tip_locked(self):
         """Ledger follows the tip. Forward-apply on extension, full reindex
-        on reorg. Metadata (miners, pq keys) snapshotted across reindex."""
+        on reorg. INVALID txs are SKIPPED (logged), never fatal: one bad
+        transfer must not freeze the chain (lesson learned on testnet)."""
         from chain import apply_tx
         new_tip = self.chain.tip
         if new_tip == self.applied_tip:
@@ -512,8 +534,7 @@ class GatewayServer:
             b = "" if set(ph) == {"0"} else ph
         if b == self.applied_tip:
             for blk in reversed(fwd):
-                for t in blk["txs"]:
-                    apply_tx(self.conn, t)
+                self._apply_block(blk)
         else:
             miners = list(self.conn.execute("SELECT * FROM miners"))
             accounts = list(self.conn.execute("SELECT * FROM pq_accounts"))
@@ -530,9 +551,18 @@ class GatewayServer:
                 self.conn.execute("INSERT OR IGNORE INTO transfers VALUES(?,?,?,?,?,?,?)", tuple(row))
             self.conn.commit()
             for blk in self.chain.path_to(new_tip):
-                for t in blk["txs"]:
-                    apply_tx(self.conn, t)
+                self._apply_block(blk)
         self.applied_tip = new_tip
+
+    def _apply_block(self, blk):
+        from chain import apply_tx
+        h = blk["header"]["height"]
+        for t in blk["txs"]:
+            try:
+                apply_tx(self.conn, t)
+            except Exception as e:
+                print(f"block {h}: skipping invalid tx ({t.get('type')}/{t.get('from','-')[:12]}): {e}",
+                      flush=True)
 
     def start_mining(self):
         def loop():

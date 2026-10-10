@@ -343,9 +343,12 @@ class Wallet:
     def _net_send(self, frm: str, to: str, amount: int):
         try:
             self.ensure_registered()
-            pkg = pq.sign(self.key["seed"], self.gw_ots(frm), frm, to, amount)
-            tx = {"type": "transfer", "from": frm, "to": to, "amount": amount, "sig": pkg}
-            r = self.gw_rpc({"op": "submit_tx", "tx": tx})
+            for attempt in (0, 1):  # retry once with fresh OTS if mempool raced us
+                pkg = pq.sign(self.key["seed"], self.gw_ots(frm), frm, to, amount)
+                tx = {"type": "transfer", "from": frm, "to": to, "amount": amount, "sig": pkg}
+                r = self.gw_rpc({"op": "submit_tx", "tx": tx})
+                if r.get("ok") or "OTS" not in str(r.get("msg", "")):
+                    break
             self.events.put(("info", f"Network send: {r.get('msg', r)} (confirms in next block)."))
         except (ValueError, ConnectionError, OSError, KeyError) as e:
             self.events.put(("info", f"Send failed: {e}"))
