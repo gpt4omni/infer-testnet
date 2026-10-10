@@ -125,10 +125,17 @@ class Chain:
         if block["header"]["height"] == 0:
             return all(t["type"] == "mint" and t.get("from", "faucet") == "faucet" for t in txs)
         subs = [t for t in txs if t["type"] == "mint" and t.get("from") == "subsidy"]
-        if len(subs) > 1:
-            return False
-        if subs and (txs[0] is not subs[0] or subs[0]["amount"] > MAX_BLOCK_REWARD_WATTS):
-            return False
+        if sum(t["amount"] for t in subs) > MAX_BLOCK_REWARD_WATTS:
+            return False  # total subsidy per block capped — the split lives inside it
+        if not subs:
+            return True  # no coinbase claimed; allowed (feeless block)
+        if txs[0] is not subs[0]:
+            return False  # producer coinbase must lead
+        job_miners = {t["miner"] for t in txs if t["type"] == "job"}
+        for s in subs[1:]:
+            # every extra subsidy mint must reward a job-miner IN this block
+            if s["to"] not in job_miners:
+                return False
         return True
 
     def work(self, tip: str) -> float:
@@ -167,6 +174,35 @@ class Chain:
         return True, f"ok ({len(path)} blocks)"
 
 
+def split_coinbase(total: int, producer_addr: str, job_txs: list[dict],
+                   producer_share: float = 0.5, height: int | None = None) -> list[dict]:
+    """Split a block's subsidy: producer takes producer_share, the rest goes
+    pro-rata by job pay to miners with jobs in THIS block (dust < 1 watt
+    skipped, remainder to producer so the sum is exact). `height` stamps
+    each mint so identical rewards in different blocks stay distinct txids
+    (idempotent apply would otherwise eat repeats)."""
+    prod = int(total * producer_share)
+    mints = []
+    tag = {"h": height} if height is not None else {}
+    if prod > 0:
+        mints.append({"type": "mint", "from": "subsidy", "to": producer_addr, "amount": prod, **tag})
+    pool = total - prod
+    by_miner: dict[str, int] = {}
+    for t in job_txs:
+        if t.get("type") == "job" and t.get("pay", 0) > 0:
+            by_miner[t["miner"]] = by_miner.get(t["miner"], 0) + t["pay"]
+    tot = sum(by_miner.values())
+    given = 0
+    for m, sc in sorted(by_miner.items(), key=lambda kv: -kv[1]):
+        amt = int(pool * sc / tot) if tot else 0
+        if amt >= 1:
+            mints.append({"type": "mint", "from": "subsidy", "to": m, "amount": amt, **tag})
+            given += amt
+    if mints:
+        mints[0]["amount"] += total - prod - given  # exact sum, dust to producer
+    return mints
+
+
 def genesis(mints: list[dict], bits: int) -> dict:
     return mine_block("00" * 32, 0, bits, [{"type": "mint", **m} for m in mints])
 
@@ -199,7 +235,13 @@ def load_chain(path: str) -> "Chain":
 # ---------------------------------------------------------------------------
 
 def apply_tx(c, tx: dict):
+    """Apply one tx idempotently: already-seen txids (re-mined across forks
+    or duplicate mempool inclusion) are skipped, so replays never double-pay."""
     from ledger import transfer, slash, log_job
+    c.execute("CREATE TABLE IF NOT EXISTS applied_txid(txid TEXT PRIMARY KEY)")
+    tid = txid(tx)
+    if c.execute("SELECT 1 FROM applied_txid WHERE txid=?", (tid,)).fetchone():
+        return "dup"
     t = tx["type"]
     if t == "mint":
         transfer(c, tx.get("from", "faucet"), tx["to"], tx["amount"])
@@ -212,6 +254,8 @@ def apply_tx(c, tx: dict):
                 tx["eval"], tx["passed"], tx["score"], tx["pay"])
     else:
         raise ValueError(f"unknown tx type {t}")
+    c.execute("INSERT INTO applied_txid VALUES(?)", (tid,))
+    return "ok"
 
 
 def rebuild_state(db_path: str, blocks: list[dict], accounts=()):

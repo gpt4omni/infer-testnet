@@ -27,6 +27,57 @@ def load_keyfile(path):
     return d
 
 
+def mine_forever(a):
+    """Open block production: pull template + mempool, assemble split
+    coinbase to own key, grind PoW, submit. Anyone can do this — that is
+    what makes production permissionless instead of operator-only."""
+    import socket
+    import time as _t
+    from net import send_msg, recv_msg
+    from money import fmt_watts
+    host, port = a.gateway.rsplit(":", 1)
+    port = int(port)
+
+    def rpc(obj, timeout=30):
+        s = socket.create_connection((host, port), timeout=timeout)
+        with s, s.makefile("rwb") as f:
+            send_msg(f, obj)
+            return recv_msg(f)
+
+    from chain import mine_block, split_coinbase, MAX_BLOCK_REWARD_WATTS
+    key = load_keyfile(a.keyfile)
+    n = 0
+    print(f"block-mining as {key['addr'][:20]}.. (Ctrl-C to stop)", flush=True)
+    while a.mine_max_blocks == 0 or n < a.mine_max_blocks:
+        try:
+            t = rpc({"template": None, "op": "template"})
+            m = rpc({"op": "get_mempool"})
+        except (ConnectionError, OSError, ValueError) as e:
+            print(f"template fetch failed: {e}; retrying…", flush=True)
+            _t.sleep(5)
+            continue
+        if t["prev_hash"] == "00" * 32 and t["height"] == 0:
+            print("no genesis yet — mining it (empty, no coinbase by consensus rule)…", flush=True)
+            from chain import mine_block as _gen
+            g = _gen("00" * 32, 0, t["bits"], [])
+            try:
+                r = rpc({"op": "submit_block", "block": g}, timeout=60)
+                print(f"genesis: {r.get('msg')} tip={r.get('height')}", flush=True)
+            except (ConnectionError, OSError, ValueError) as e:
+                print(f"submit failed: {e}", flush=True)
+            _t.sleep(2)
+            continue
+        txs = m.get("txs", [])
+        coin = split_coinbase(min(m.get("cap_watts", MAX_BLOCK_REWARD_WATTS), MAX_BLOCK_REWARD_WATTS),
+                              key["addr"], txs, height=t["height"])
+        blk = mine_block(t["prev_hash"], t["height"], t["bits"], coin + txs)
+        try:
+            r = rpc({"op": "submit_block", "block": blk}, timeout=60)
+        except (ConnectionError, OSError, ValueError) as e:
+            print(f"submit failed: {e}", flush=True)
+            continue
+        n += 1
+        print(f"block {t['height']}: {r.get('msg')} tip={r.get('height')} ({len(txs)} mempool txs)", flush=True)
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", required=True, help="host:port")
@@ -36,6 +87,9 @@ def main():
     ap.add_argument("--backend", default="mock", choices=["mock", "cheat", "gpu"])
     ap.add_argument("--jobs", type=int, default=10, help="0 = forever")
     ap.add_argument("--price", type=float, default=0.02)
+    ap.add_argument("--mine", action="store_true",
+                    help="produce blocks too (open production): fetch mempool, grind PoW, submit")
+    ap.add_argument("--mine-max-blocks", type=int, default=0, help="0 = forever")
     a = ap.parse_args()
 
     host, port = a.gateway.rsplit(":", 1)
@@ -51,6 +105,9 @@ def main():
         be, model = MockBackend("good"), "mock-7b"
 
     from money import fmt_watts
+    if a.mine:
+        mine_forever(a)
+        return
     if a.no_tls:
         from net import MinerClient
         print("WARNING: plaintext transport (loopback only)", flush=True)

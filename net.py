@@ -168,6 +168,13 @@ class GatewayServer:
                       "burned_watts": burned_watts(self.conn)}
             self._http(f, 200, json.dumps(st).encode(), "application/json")
             return None
+        if path == "/blocks" and method == "GET":
+            self._http(f, 200, self._explorer_blocks().encode(), "text/html; charset=utf-8")
+            return None
+        if path.startswith("/block/") and method == "GET":
+            self._http(f, 200, self._explorer_block(path[len("/block/"):]).encode(),
+                       "text/html; charset=utf-8")
+            return None
         self._http(f, 200, b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}',
                    "application/json")
         return None
@@ -177,6 +184,50 @@ class GatewayServer:
         f.write(f"HTTP/1.1 {code} {'OK' if code == 200 else 'ERR'}\r\nContent-Type: {ctype}\r\n"
                 f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
         f.flush()
+
+    def _explorer_blocks(self) -> str:
+        from chain import header_hash
+        with self.lock:
+            tip, height = self.chain.tip, self.chain.height
+            rows = []
+            b = tip
+            for _ in range(50):
+                blk = self.chain.blocks.get(b)
+                if blk is None:
+                    break
+                h = blk["header"]
+                rows.append((h["height"], header_hash(h)[:16], len(blk["txs"])))
+                b = h["prev_hash"] if h["height"] else ""
+        items = "".join(f'<tr><td><a href="/block/{hh}">{hh}</a></td><td>{n}</td><td>{c}</td></tr>'
+                        for hh, n, c in sorted(rows, reverse=True))
+        return (f"<!doctype html><html><head><meta charset=utf8><title>Infer Explorer</title>"
+                f"<style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 1em}}"
+                f"table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.4em}}</style>"
+                f"</head><body><h1>&#9672; Infer Explorer</h1>"
+                f"<p>tip height {height} &middot; <a href='/'>faucet</a></p>"
+                f"<table><tr><th>height</th><th>hash</th><th>txs</th></tr>{items}</table></body></html>")
+
+    def _explorer_block(self, which: str) -> str:
+        from chain import header_hash
+        with self.lock:
+            blk = self.chain.blocks.get(which)
+            if blk is None:
+                for b in self.chain.blocks.values():
+                    if str(b["header"]["height"]) == which:
+                        blk = b
+                        break
+            if blk is None:
+                return "<h1>unknown block</h1><p><a href='/blocks'>back</a></p>"
+            h = blk["header"]
+            txrows = "".join(
+                f"<tr><td>{t.get('type')}</td><td>{(t.get('from') or t.get('miner') or '')[:20]}</td>"
+                f"<td>{(t.get('to') or '')[:20]}</td><td>{t.get('amount', t.get('pay', ''))}</td></tr>"
+                for t in blk["txs"])
+        return (f"<!doctype html><html><head><meta charset=utf8><title>block {h['height']}</title></head><body>"
+                f"<h1>block {h['height']}</h1><p>hash {header_hash(h)}<br>prev {h['prev_hash'][:16]}.."
+                f"<br>nonce {h['nonce']} &middot; <a href='/blocks'>all blocks</a></p>"
+                f"<table border=1 cellpadding=4><tr><th>type</th><th>from/miner</th><th>to</th><th>amount/pay</th></tr>"
+                f"{txrows}</table></body></html>")
 
     def _faucet_claim(self, f, ip, body: bytes):
         """PoW-captcha drip: 1 claim/IP/day, small amount, all auditable."""
@@ -254,7 +305,8 @@ class GatewayServer:
                 if hello is None:  # was an HTTP healthcheck; answered already
                     return
                 if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
-                                        "balance", "history", "next_ots", "register_pq", "submit_tx"):
+                                        "balance", "history", "next_ots", "register_pq", "submit_tx",
+                                        "template", "get_mempool"):
                     self.handle_wan(f, hello, ip)  # one-shot WAN ops, no session needed
                     return
                 if hello.get("op") == "register_pq":
@@ -339,6 +391,20 @@ class GatewayServer:
                 send_msg(f, {"queued": len(self.mempool), "tip": self.chain.tip,
                              "height": self.chain.height})
             return True
+        if op == "get_mempool":
+            from chain import MAX_BLOCK_REWARD_WATTS
+            with self.lock:
+                send_msg(f, {"tip": self.chain.tip, "height": self.chain.height,
+                             "txs": self.mempool[:200], "cap_watts": MAX_BLOCK_REWARD_WATTS})
+            return True
+        if op == "template":
+            from chain import retarget
+            with self.lock:
+                tip, height = self.chain.tip, self.chain.height
+                bits = retarget(self.chain.path_to(tip)) if tip else self.bits
+            send_msg(f, {"prev_hash": tip or "00" * 32, "height": (height + 1) if tip else 0,
+                         "bits": bits})
+            return True
         if op == "balance":
             from ledger import balance_watts
             with self.lock:
@@ -372,7 +438,10 @@ class GatewayServer:
             with self.lock:
                 ok, msg = self.chain.add(req["block"])
                 if ok:
+                    from chain import txid as _txid
                     self.persist(req["block"])
+                    mine_ids = {_txid(t) for t in req["block"]["txs"]}
+                    self.mempool = [m for m in self.mempool if _txid(m) not in mine_ids]
                     self.apply_tip_locked()
             send_msg(f, {"ok": ok, "msg": msg, "tip": self.chain.tip,
                          "height": self.chain.height})
@@ -496,8 +565,9 @@ class GatewayServer:
                 self._idle_rounds = 0
         n_mem = len(txs)
         if tip and self.reward_addr and self.block_reward:
-            txs = [{"type": "mint", "from": "subsidy", "to": self.reward_addr,
-                    "amount": self.block_reward}] + txs
+            from chain import split_coinbase
+            txs = split_coinbase(self.block_reward, self.reward_addr, txs,
+                                 height=height + 1) + txs
         if not tip:
             txs, n_mem = [], 0  # genesis carries no user txs (consensus rule)
             blk = mine_block("00" * 32, 0, self.bits, txs)
@@ -539,9 +609,11 @@ class GatewayServer:
             miners = list(self.conn.execute("SELECT * FROM miners"))
             accounts = list(self.conn.execute("SELECT * FROM pq_accounts"))
             issued = list(self.conn.execute("SELECT * FROM transfers WHERE from_id IN ('faucet','subsidy')"))
+            self.conn.execute("CREATE TABLE IF NOT EXISTS applied_txid(txid TEXT PRIMARY KEY)")
             self.conn.execute("DELETE FROM jobs")
             self.conn.execute("DELETE FROM transfers")
             self.conn.execute("DELETE FROM slashes")
+            self.conn.execute("DELETE FROM applied_txid")
             self.conn.commit()
             for m in miners:
                 self.conn.execute("INSERT OR REPLACE INTO miners VALUES(?,?,?,?,?)", tuple(m))

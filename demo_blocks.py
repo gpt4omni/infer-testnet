@@ -39,7 +39,7 @@ def main():
     for _ in range(3):
         print(cl.run_job(), flush=True)
     cl.close()
-    wait_height(1)
+    wait_height(2)  # genesis + one block per batch
     bal = balance_watts(connect(DB), "live-miner")
     print(f"tip height={srv.chain.height} balance={fmt_watts(bal)}")
     assert srv.chain.height >= 1 and bal > 0
