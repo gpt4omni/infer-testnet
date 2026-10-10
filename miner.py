@@ -35,9 +35,18 @@ GOOD_FIXTURES = {
 }
 
 
+TASK_STUBS = {
+    "add": 'def solve(a, b):\n    """Return a+b."""',
+    "fib": 'def solve(n):\n    """Return the nth Fibonacci number (solve(0)=0, solve(1)=1)."""',
+    "reverse": 'def solve(s):\n    """Return s reversed."""',
+    "sortnums": 'def solve(xs):\n    """Return sorted(xs) ascending."""',
+    "vowels": 'def solve(s):\n    """Return the number of vowels (aeiouAEIOU) in s."""',
+}
+
+
 class LlamaCppBackend:
     def __init__(self, url="http://127.0.0.1:19091/v1/chat/completions",
-                 model="gemma-4-12b", api_key=None, timeout=180):
+                 model="qwen2.5-0.5b-Q4", api_key=None, timeout=180):
         self.url, self.model, self.timeout = url, model, timeout
         if api_key is None:  # atomic-chat default key location
             try:
@@ -49,11 +58,10 @@ class LlamaCppBackend:
 
     def generate(self, prompt: str) -> str:
         t0 = time.time()
-        user = ("Output ONLY a python fenced code block defining solve(). "
-                "No explanation, no analysis. "
-                "Signatures: add->solve(a,b), fib->solve(n), reverse->solve(s), "
-                "sortnums->solve(xs) returns sorted(xs), vowels->solve(s) returns int vowel count. "
-                f"Task: {prompt}")
+        stub = TASK_STUBS.get(prompt, "def solve(x):\n    pass")
+        user = ("Define EXACTLY this Python function and nothing else "
+                "(no other functions, no print, no examples). "
+                "Output only a python fenced code block.\n\n" + stub)
         body = json.dumps({
             "model": self.model,
             "messages": [{"role": "user", "content": user}],

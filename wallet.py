@@ -25,7 +25,7 @@ import pq
 
 DB = os.path.join(os.path.dirname(__file__), "wallet.db")
 KEYFILE = os.path.join(os.path.dirname(__file__), "wallet-pq.json")
-BACKENDS = {"Mock 7B (fast)": "mock", "Real 1080 Ti GPU": "gpu"}
+BACKENDS = {"Tiny 0.5B (fast GPU)": "tiny", "Mock 7B (instant)": "mock"}
 GPU_URL = "http://127.0.0.1:19091/health"
 
 
@@ -155,8 +155,8 @@ class Wallet:
         ttk.Label(acct, text="Backend").grid(row=1, column=0, sticky="w", pady=2)
         brow = ttk.Frame(acct)
         brow.grid(row=1, column=1, sticky="w", padx=4)
-        self.backend = tk.StringVar(value="Mock 7B (fast)")
-        ttk.OptionMenu(brow, self.backend, "Mock 7B (fast)", *BACKENDS,
+        self.backend = tk.StringVar(value="Tiny 0.5B (fast GPU)")
+        ttk.OptionMenu(brow, self.backend, "Tiny 0.5B (fast GPU)", *BACKENDS,
                        command=lambda *_: self.refresh_gpu()).pack(side="left")
         self.gpu_dot = tk.StringVar(value="●")
         ttk.Label(brow, textvariable=self.gpu_dot, font=("", 12)).pack(side="left", padx=6)
@@ -252,9 +252,12 @@ class Wallet:
         return int(self.gw_rpc({"op": "next_ots", "miner_id": addr})["ots"])
 
     def _backend(self):
-        if BACKENDS[self.backend.get()] == "gpu" and gpu_alive():
+        if BACKENDS[self.backend.get()] == "tiny":
+            if not gpu_alive():
+                self.say("Tiny server down at 19091 — mining mock instead.", "bad")
+                return MockBackend("good"), "mock-7b", 0.02
             from miner import LlamaCppBackend
-            return LlamaCppBackend(), "gemma-4-12B-Q4", 0.05
+            return LlamaCppBackend(model="qwen2.5-0.5b-Q4"), "qwen2.5-0.5b-Q4", 0.005
         return MockBackend("good"), "mock-7b", 0.02
 
     def net_miner(self, mid: str, backend_kind: str):
@@ -267,17 +270,15 @@ class Wallet:
         return MinerClient(mid, be, self.gw["host"], self.gw["port"], model, price), "plain"
 
     def _backend_kind(self, kind: str):
-        if kind == "gpu" and gpu_alive():
+        if kind == "tiny" and gpu_alive():
             from miner import LlamaCppBackend
-            return LlamaCppBackend(), "gemma-4-12B-Q4", 0.05
+            return LlamaCppBackend(model="qwen2.5-0.5b-Q4"), "qwen2.5-0.5b-Q4", 0.005
         return MockBackend("good"), "mock-7b", 0.02
 
     # -- actions (main thread) -------------------------------------------
     def miner(self):
         mid = self.mid.get().strip() or self.key["addr"]
         be, model, price = self._backend()
-        if BACKENDS[self.backend.get()] == "gpu" and model == "mock-7b":
-            self.say("GPU server down at 19091 — mining mock instead.", "bad")
         return Miner(mid, be, model, price)
 
     def copy_addr(self):
