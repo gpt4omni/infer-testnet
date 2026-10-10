@@ -32,10 +32,11 @@ input{width:100%;padding:.6em;font-family:monospace;box-sizing:border-box}button
 test watts, never for real money. No mining here; miners run <tt>miner_node.py</tt>.</p>
 <div id=setup><button id=new>＋ Create wallet</button></div>
 <div id=app style="display:none">
-<p>Address: <code id=addr></code><br>Balance: <b id=bal></b></p>
+<p>Address: <code id=addr></code><br>Balance: <b id=bal></b> <small id=keys></small></p>
 <input id=to placeholder="pq1... recipient">
 <input id=amt placeholder="watts (e.g. 1000)">
 <button id=send>Send</button> <button id=refresh>Refresh</button>
+<button id=rot title="Fresh key + sweep balance before keys run out">Rotate key</button>
 <h3>Transfers</h3><div id=txs></div>
 </div>
 <p id=log>idle</p>
@@ -50,6 +51,8 @@ async function refresh(){
  document.getElementById('addr').textContent = m.addr;
  document.getElementById('bal').textContent = m.balance_watts >= 1e6
   ? (m.balance_watts/1e6).toFixed(3)+' INFR' : m.balance_watts+' watts';
+ document.getElementById('keys').textContent = `(${m.ots_left} sig keys left` +
+  (m.ots_left < 32 ? ' — ROTATE SOON' : '') + ')';
  document.getElementById('txs').innerHTML = m.transfers.map(t =>
   `<div>${t[0]===m.addr?'&larr;':'&rarr;'} ${t[2]} watts <small>${(t[0]===m.addr?t[1]:t[0]).slice(0,18)}…</small></div>`).join('') || '(none yet — claim the faucet)';
  log('synced');
@@ -65,6 +68,12 @@ document.getElementById('send').onclick = async () => {
  log(r.ok ? 'queued — confirms in next block' : 'denied: '+r.msg); refresh();
 };
 document.getElementById('refresh').onclick = refresh;
+document.getElementById('rot').onclick = async () => {
+ if(!confirm('Move full balance to a fresh key?')) return;
+ const r = await (await fetch('/api/web/rotate',{method:'POST'})).json();
+ log(r.ok ? `rotated to ${r.addr.slice(0,18)}… (${r.swept_watts} watts swept)` : 'rotate denied: '+r.msg);
+ refresh();
+};
 refresh();
 </script></body></html>"""
 
@@ -255,6 +264,9 @@ class GatewayServer:
         if path == "/api/web/send" and method == "POST":
             self._web_send(f, headers, body)
             return None
+        if path == "/api/web/rotate" and method == "POST":
+            self._web_rotate(f, headers)
+            return None
         self._http(f, 200, b'{"ok":true,"service":"infer-gateway","protocol":"tcp+json"}',
                    "application/json")
         return None
@@ -336,15 +348,55 @@ class GatewayServer:
             self._http(f, 401, b'{"ok":false,"msg":"no session (create a wallet first)"}',
                        "application/json")
             return
-        from ledger import balance_watts
+        from ledger import balance_watts, next_ots
         with self.lock:
             bal = balance_watts(self.conn, addr)
+            left = 256 - next_ots(self.conn, addr)
             txs = self.conn.execute(
                 "SELECT from_id, to_id, amount_watts FROM transfers "
                 "WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT 20", (addr, addr)).fetchall()
         self._http(f, 200, json.dumps(
-            {"ok": True, "addr": addr, "balance_watts": bal, "transfers": txs}).encode(),
+            {"ok": True, "addr": addr, "balance_watts": bal, "ots_left": left,
+             "transfers": txs}).encode(),
             "application/json")
+
+    def _web_rotate(self, f, headers):
+        """Fresh key + sweep full balance before OTS exhaustion bricks the wallet."""
+        addr = self._web_session_addr(headers)
+        if addr is None:
+            self._http(f, 401, b'{"ok":false,"msg":"no session"}', "application/json")
+            return
+        import pq as _pq
+        from ledger import balance_watts, next_ots
+        with self.lock:
+            row = self.conn.execute("SELECT seed_hex FROM web_wallets WHERE addr=?", (addr,)).fetchone()
+            bal = balance_watts(self.conn, addr)
+            ots = next_ots(self.conn, addr)
+        if row is None:
+            self._http(f, 400, b'{"ok":false,"msg":"unknown wallet"}', "application/json")
+            return
+        import hashlib as _hl
+        new = _pq.generate()
+        new_root = _pq.root_of(bytes.fromhex(new["seed"])).hex()
+        pkg = None
+        if bal > 0:
+            pkg = _pq.sign(row[0], ots, addr, new["addr"], bal)
+            ok, msg = self.mempool_add({"type": "transfer", "from": addr, "to": new["addr"],
+                                        "amount": bal, "sig": pkg})
+            if not ok:
+                self._http(f, 400, json.dumps({"ok": False, "msg": msg}).encode(),
+                           "application/json")
+                return
+        with self.lock:
+            from ledger import register_pq
+            register_pq(self.conn, new["addr"], new_root)
+            self.conn.execute("INSERT INTO web_wallets VALUES(?,?)", (new["addr"], new["seed"]))
+            tok = self._cookies(headers).get("infer_session", "")
+            self.conn.execute("UPDATE web_sessions SET addr=? WHERE token=?",
+                              (new["addr"], _hl.sha256(tok.encode()).hexdigest()))
+            self.conn.commit()
+        self._http(f, 200, json.dumps({"ok": True, "addr": new["addr"], "swept_watts": bal}).encode(),
+                   "application/json")
 
     def _web_send(self, f, headers, body: bytes):
         addr = self._web_session_addr(headers)
