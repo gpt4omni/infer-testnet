@@ -700,7 +700,12 @@ class GatewayServer:
                 from judge import DJudge
                 with self.lock:
                     ctx = self.infer_prompts.get(req["job_id"], "general inference")
-                q = DJudge(timeout=30).quality(ctx, str(req.get("output", ""))[:2000])
+                j = DJudge(timeout=60)
+                q = j.quality(ctx, str(req.get("output", ""))[:2000])
+                if q is None:  # transient overload: one retry before abstaining
+                    import time as _rt
+                    _rt.sleep(3)
+                    q = j.quality(ctx, str(req.get("output", ""))[:2000])
             except Exception:
                 q = None
             paid = 0
