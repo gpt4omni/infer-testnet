@@ -111,6 +111,11 @@ def slash(c, entity, kind, amount_watts, reason):
     if kind == "miner":
         c.execute("UPDATE miners SET slashed_watts=slashed_watts+? WHERE id=?",
                   (amount_watts, entity))
+        # burn locked stake first: slashing costs real collateral, not rows
+        take = min(staked_watts(c, entity), amount_watts)
+        if take > 0:
+            c.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts) VALUES(?,?,?,?)",
+                      (stake_sink(entity), "burn", take, time.time()))
     c.commit()
 
 
@@ -159,6 +164,7 @@ def transfer(c, from_id: str, to_id: str, amount_watts: int, sig_pkg: dict | Non
         ots = int(sig_pkg["ots"])
         if c.execute("SELECT 1 FROM transfers WHERE from_id=? AND ots=?", (from_id, ots)).fetchone():
             raise ValueError("OTS index reused — signature replay rejected")
+        _ots_mark(c, from_id, ots)
         try:
             c.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts,sig_json,ots)"
                       " VALUES(?,?,?,?,?,?)",
@@ -193,3 +199,67 @@ def subsidy_issued_watts(c) -> int:
 
 def burned_watts(c) -> int:
     return c.execute("SELECT COALESCE(SUM(amount_watts),0) FROM transfers WHERE to_id='burn'").fetchone()[0]
+
+
+def stake_sink(addr: str) -> str:
+    return f"stake:{addr}"
+
+
+def staked_watts(c, addr: str) -> int:
+    """Locked collateral = in(sink) - out(sink). Comes out of the owner's
+    balance automatically (transfers move real money into the sink)."""
+    sink = stake_sink(addr)
+    inn = c.execute("SELECT COALESCE(SUM(amount_watts),0) FROM transfers WHERE to_id=?",
+                    (sink,)).fetchone()[0]
+    out = c.execute("SELECT COALESCE(SUM(amount_watts),0) FROM transfers WHERE from_id=?",
+                    (sink,)).fetchone()[0]
+    return inn - out
+
+
+def _ots_mark(c, addr: str, n: int):
+    """Claim an OTS index atomically; losers of a race get a clean rejection."""
+    c.execute("CREATE TABLE IF NOT EXISTS ots_used(addr TEXT, ots INTEGER, PRIMARY KEY(addr, ots))")
+    try:
+        c.execute("INSERT INTO ots_used VALUES(?,?)", (addr, n))
+    except sqlite3.IntegrityError:
+        raise ValueError("OTS index reused — signature replay rejected")
+
+
+def stake_lock(c, addr: str, amount_watts: int, sig_pkg: dict):
+    """Lock own funds as serving collateral. One PQ signature over
+    stake|<addr>|<amount>|<next-ots>; funds move addr -> sink via protocol
+    execution (same pattern as HTLC fulfill)."""
+    import pq as _pq
+    import time as _t
+    if amount_watts <= 0:
+        raise ValueError("amount must be positive")
+    row = c.execute("SELECT root_hex FROM pq_accounts WHERE addr=?", (addr,)).fetchone()
+    if row is None:
+        raise ValueError("unknown PQ account")
+    if balance_watts(c, addr) < amount_watts:
+        raise ValueError("insufficient balance to lock")
+    n = next_ots(c, addr)
+    if not _pq.verify(addr, row[0], sig_pkg, f"stake|{addr}|{amount_watts}|{n}", amount_watts):
+        raise ValueError("bad stake signature")
+    _ots_mark(c, addr, n)
+    c.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts) VALUES(?,?,?,?)",
+              (addr, stake_sink(addr), amount_watts, _t.time()))
+    c.commit()
+
+
+def stake_unlock(c, addr: str, amount_watts: int, sig_pkg: dict):
+    """Release collateral back to liquid (signed; capped at locked amount)."""
+    import pq as _pq
+    import time as _t
+    row = c.execute("SELECT root_hex FROM pq_accounts WHERE addr=?", (addr,)).fetchone()
+    if row is None:
+        raise ValueError("unknown PQ account")
+    if staked_watts(c, addr) < amount_watts:
+        raise ValueError("unlock exceeds locked stake")
+    n = next_ots(c, addr)
+    if not _pq.verify(addr, row[0], sig_pkg, f"unstake|{addr}|{amount_watts}|{n}", amount_watts):
+        raise ValueError("bad unstake signature")
+    _ots_mark(c, addr, n)
+    c.execute("INSERT INTO transfers(from_id,to_id,amount_watts,ts) VALUES(?,?,?,?)",
+              (stake_sink(addr), addr, amount_watts, _t.time()))
+    c.commit()

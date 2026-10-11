@@ -167,9 +167,12 @@ class GatewayServer:
         self.miner_stats = {}  # miner_id -> [accepted, total] (customer feedback)
         self.d1_hist = {}  # miner_id -> deque(maxlen=20) of recent d1 scores
         self.miner_seen = {}  # miner_id -> last-seen epoch seconds
+        self.served_outputs = _c.deque(maxlen=500)  # (prompt_hash, output_hash, ts): replay radar
+        self.REPLAY_WINDOW_SEC = 24 * 3600
         self.D1_LOW = 0.3  # below: deprioritized for paid infer work
         self.D1_GOOD = 0.5  # at/above: preferred
         self.ACTIVE_TTL = 120  # seconds a miner counts as connected
+        self.MIN_INFER_STAKE_WATTS = 1_000_000  # 1 INFR locked to serve paid infer (Sybil toll)
         try:
             self.chain = load_chain(chain_path)
         except ValueError as e:
@@ -680,38 +683,56 @@ class GatewayServer:
         if op == "infer_result":
             with self.lock:
                 r = self.infer_results.get(req.get("job_id", ""))
-            send_msg(f, dict({"ok": r is not None}, **(r or {})))
+            if r is not None and r.get("status") != "done":
+                send_msg(f, {"ok": False, "status": r.get("status", "pending")})
+            else:
+                send_msg(f, dict({"ok": r is not None}, **(r or {})))
             return True
         if op == "submit_infer":
+            from miner import sha
+            import time as _rt0
             with self.lock:
+                ctx0 = self.infer_prompts.get(req["job_id"], "")
+            ph = sha(ctx0)
+            oh = sha(str(req.get("output", "")))
+            with self.lock:
+                replay = any(p == ph and o == oh and _rt0.time() - ts < self.REPLAY_WINDOW_SEC
+                             for p, o, ts in self.served_outputs)
+                if not replay:
+                    self.served_outputs.append((ph, oh, _rt0.time()))
                 self.infer_results[req["job_id"]] = {
-                    "status": "done", "output": str(req.get("output", ""))[:8000],
+                    "status": "scoring", "output": str(req.get("output", ""))[:8000],
                     "miner": req.get("miner_id", ""), "ms": float(req.get("latency_ms", 0))}
                 st = self.miner_stats.setdefault(req.get("miner_id", ""), [0, 0])
                 st[1] += 1
                 self.note_seen(req.get("miner_id", ""))
-            send_msg(f, {"ok": True})
+            # Replay radar: identical output already served for this prompt
+            # recently. No d1 call wasted, score forced 0, no pay. Deterministic
+            # (temp-0) miners should add nonces; exact repeats look like theft.
             # d1 quality score gates payment automatically: at/above threshold
             # the quoted watts settle with no customer action, so answers
             # can't be taken for free and good work can't be stiffed.
             # Ground truth (unit tests) still rules code tasks; feedback stays
             # as a pure rating signal.
-            try:
-                from judge import DJudge
-                with self.lock:
-                    ctx = self.infer_prompts.get(req["job_id"], "general inference")
-                j = DJudge(timeout=60)
-                q = j.quality(ctx, str(req.get("output", ""))[:2000])
-                if q is None:  # transient overload: one retry before abstaining
-                    import time as _rt
-                    _rt.sleep(3)
+            # Scored BEFORE ack: rows are complete at first read, so pollers
+            # never see unstamped results (that race showed phantom "unscored").
+            if replay:
+                q = 0.0
+            else:
+                try:
+                    from judge import DJudge
+                    with self.lock:
+                        ctx = self.infer_prompts.get(req["job_id"], "general inference")
+                    j = DJudge(timeout=45)
                     q = j.quality(ctx, str(req.get("output", ""))[:2000])
-            except Exception:
-                q = None
+                except Exception:
+                    q = None
             paid = 0
             note = "judge abstained — no score, no pay"
             if q is not None and q < self.D1_PAY_THRESHOLD:
                 note = f"d1={q:.2f} below pay line — miner unpaid"
+            if replay:
+                note = "replay detected — identical output already served (no pay)"
             if q is not None:
                 with self.lock:
                     if req["job_id"] in self.infer_results:
@@ -749,6 +770,10 @@ class GatewayServer:
                     self.infer_terms.pop(req["job_id"], None)
                     if req["job_id"] in self.infer_results:
                         self.infer_results[req["job_id"]]["pay_note"] = note
+            with self.lock:
+                if req["job_id"] in self.infer_results:
+                    self.infer_results[req["job_id"]]["status"] = "done"
+            send_msg(f, {"ok": True})
             return True
         if op == "feedback":
             with self.lock:
@@ -758,6 +783,15 @@ class GatewayServer:
                 st[1] = max(st[1], 1)
                 acc = st[0] / st[1]
             send_msg(f, {"ok": True, "accept_rate": acc})
+            return True
+        if op in ("stake", "unstake"):
+            from ledger import stake_lock, stake_unlock, staked_watts
+            try:
+                addr, amt, pkg = req["addr"], int(req["amount"]), req["sig"]
+                (stake_lock if op == "stake" else stake_unlock)(self.conn, addr, amt, pkg)
+                send_msg(f, {"ok": True, "staked_watts": staked_watts(self.conn, addr)})
+            except (ValueError, KeyError, TypeError) as e:
+                send_msg(f, {"ok": False, "msg": str(e)[:120]})
             return True
         if op == "template":
             from chain import retarget
@@ -908,8 +942,13 @@ class GatewayServer:
     def infer_eligible(self, miner_id: str) -> bool:
         """Paid infer work goes to the capable first. Below-threshold miners
         get tasks (still paid by subsidy) unless nobody better is around —
-        coverage beats purity, but quality earns the premium flow."""
+        coverage beats purity, but quality earns the premium flow.
+        No stake locked, no paid infer at all: spawning identities is free,
+        losing stake is not (Sybil toll)."""
         import time as _t
+        from ledger import staked_watts
+        if staked_watts(self.conn, miner_id) < self.MIN_INFER_STAKE_WATTS:
+            return False
         avg = self.d1_avg(miner_id)
         if avg is None or avg >= self.D1_LOW:
             return True
