@@ -19,9 +19,9 @@ import urllib.request
 
 JUDGE_URL = "http://127.0.0.1:19092/v1/systemone"
 
-# Hosted fallback (Jev API, System-One compatible). Key NEVER in source:
+# Hosted fallback (TypeSafe Jev API, System-One compatible). Key NEVER in source:
 # export JEV_API_KEY=...  / Railway service variable.
-JEV_URL = "https://jev-api.com/v1/systemone"
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
 
 
