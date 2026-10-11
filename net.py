@@ -752,12 +752,19 @@ class GatewayServer:
             if replay:
                 q = 0.0
             else:
+                # Jury panel: local d1 + hosted Jev (if key), median wins.
+                # One judge down = the other decides alone (recorded). Both down = abstain.
                 try:
                     from judge import DJudge
                     with self.lock:
                         ctx = self.infer_prompts.get(req["job_id"], "general inference")
-                    j = DJudge(timeout=45)
-                    q = j.quality(ctx, str(req.get("output", ""))[:2000])
+                    panel = DJudge(timeout=45).panel(ctx, str(req.get("output", ""))[:2000])
+                    q = panel["score"]
+                    with self.lock:
+                        if req["job_id"] in self.infer_results:
+                            self.infer_results[req["job_id"]]["judges"] = panel["sources"]
+                            if panel["disagree"]:
+                                self.infer_results[req["job_id"]]["judges_disagree"] = True
                 except Exception:
                     q = None
             paid = 0
@@ -1128,6 +1135,63 @@ class GatewayServer:
                     self.mine_round()
                 except Exception as e:
                     print(f"mine round failed: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def start_peer_sync(self, peers: list[str], interval: int = 30, max_depth: int = 50):
+        """Pull heavier tips from peer gateways; validate + apply locally.
+        Plain TCP (LAN/testnet); untrusted data, fully revalidated on receipt
+        (PoW, merkle, money rules, reorg cap, checkpoints all still apply)."""
+        import socket as _s
+        import time as _st
+
+        def rpc(host, port, obj, timeout=20):
+            s = _s.create_connection((host, port), timeout=timeout)
+            with s, s.makefile("rwb") as f:
+                send_msg(f, obj)
+                return recv_msg(f)
+
+        def once():
+            for peer in peers:
+                try:
+                    host, port = peer.rsplit(":", 1)
+                    t = rpc(host, int(port), {"op": "get_tip"})
+                    if not t.get("tip") or t.get("height", -1) <= self.chain.height:
+                        continue
+                    # walk back to a hash we know (bounded)
+                    hashes, h, tip = [], t["tip"], t["tip"]
+                    for _ in range(max_depth):
+                        if h in self.chain.blocks:
+                            break
+                        r = rpc(host, int(port), {"op": "get_block", "hash": h})
+                        if not r.get("ok"):
+                            break
+                        hashes.append(r["block"])
+                        h = r["block"]["header"]["prev_hash"] if r["block"]["header"]["height"] else ""
+                        if not h or set(h) == {"0"}:
+                            break
+                    else:
+                        continue
+                    added = 0
+                    with self.lock:
+                        for blk in reversed(hashes):
+                            ok, _ = self.chain.add(blk)
+                            if ok:
+                                self.persist(blk)
+                                added += 1
+                        if added:
+                            self.apply_tip_locked()
+                    if added:
+                        print(f"synced {added} blocks from {peer} (tip={self.chain.height})", flush=True)
+                except (ConnectionError, OSError, ValueError, KeyError):
+                    continue
+
+        def loop():
+            while True:
+                _st.sleep(interval)
+                try:
+                    once()
+                except Exception as e:
+                    print(f"peer sync failed: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
 

@@ -90,9 +90,8 @@ class DJudge:
     def __init__(self, url: str = JUDGE_URL, timeout: float = 60.0):
         self.url, self.timeout = url, timeout
 
-    def rate(self, prompt: str, answer: str, reference: str = "") -> dict:
-        """Returns {correct_p, useful_p} in [0,1] (None each if abstaining).
-        Local d1 first; hosted Jev API fallback (needs JEV_API_KEY)."""
+    def score_local(self, prompt: str, answer: str, reference: str = "") -> dict:
+        """Local d1 only (no hosted fallback)."""
         ref = f"\nReference (ground truth, may be empty): {reference}" if reference else ""
         state = f"Task: {prompt}\nMiner answer: {answer[:2000]}{ref}"
         questions = {
@@ -102,16 +101,67 @@ class DJudge:
         }
         out = _ask(self.url, state, questions, self.timeout)
         if out is None:
-            out = _ask_remote(state, questions, self.timeout)
-        if not out:
             return {"correct_p": None, "useful_p": None}
-        res = out.get("answers", out.get("results", out))
-        cp = _noul(res.get("correct"))
-        up = _score_norm(res.get("useful"))
-        return {"correct_p": cp, "useful_p": up}
+        return _parse(out)
+
+    def score_remote(self, prompt: str, answer: str, reference: str = "") -> dict:
+        ref = f"\nReference (ground truth, may be empty): {reference}" if reference else ""
+        state = f"Task: {prompt}\nMiner answer: {answer[:2000]}{ref}"
+        questions = {
+            "correct": {"type": "noul", "instructions": "Is the miner answer correct for the task?"},
+            "useful": {"type": "score", "instructions": "How useful is the miner answer?",
+                       "criteria": ["useless", "partially useful", "fully useful"]},
+        }
+        out = _ask_remote(state, questions, self.timeout)
+        if out is None:
+            return {"correct_p": None, "useful_p": None}
+        return _parse(out)
+
+    def rate(self, prompt: str, answer: str, reference: str = "") -> dict:
+        """Returns {correct_p, useful_p} in [0,1] (None each if abstaining).
+        Local d1 first; hosted Jev API fallback (needs JEV_API_KEY)."""
+        r = self.score_local(prompt, answer, reference)
+        if r["correct_p"] is None and r["useful_p"] is None:
+            return self.score_remote(prompt, answer, reference)
+        return r
 
     def quality(self, prompt: str, answer: str, reference: str = "") -> float | None:
         """Single number for pricing: mean of available signals, None if judge down."""
         r = self.rate(prompt, answer, reference)
         ps = [x for x in (r["correct_p"], r["useful_p"]) if x is not None]
         return sum(ps) / len(ps) if ps else None
+
+    def panel(self, prompt: str, answer: str, reference: str = "") -> dict:
+        """Jury of available judges: local d1 + hosted Jev (if key set).
+        Returns {score (median), sources, n, disagree}. One judge down =
+        the other decides alone (noted in sources). Both down = abstain.
+        Remote is fallback + 10% spot audit (it bills per call; local is free)."""
+        import random as _r
+        import statistics as _st
+        scores, sources = [], []
+        rl = self.score_local(prompt, answer, reference)
+        pl = [x for x in (rl["correct_p"], rl["useful_p"]) if x is not None]
+        if pl:
+            scores.append(sum(pl) / len(pl))
+            sources.append("local-d1")
+        if not scores or _r.random() < 0.1:
+            rr = self.score_remote(prompt, answer, reference)
+            pr = [x for x in (rr["correct_p"], rr["useful_p"]) if x is not None]
+            if pr:
+                scores.append(sum(pr) / len(pr))
+                sources.append("hosted-jev")
+        if not scores:
+            return {"score": None, "sources": [], "n": 0, "disagree": False}
+        med = _st.median(scores)
+        disagree = (max(scores) - min(scores)) > 0.3 if len(scores) > 1 else False
+        return {"score": med, "sources": sources, "n": len(scores), "disagree": disagree}
+
+
+
+def _parse(out: dict) -> dict:
+    if not out:
+        return {"correct_p": None, "useful_p": None}
+    res = out.get("answers", out.get("results", out))
+    cp = _noul(res.get("correct"))
+    up = _score_norm(res.get("useful"))
+    return {"correct_p": cp, "useful_p": up}

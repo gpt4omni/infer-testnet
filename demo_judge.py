@@ -26,7 +26,17 @@ def main():
         os.remove(db)
     srv = GatewayServer(connect(db, check_same_thread=False), port=0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    cl = MinerClient("judge-miner", MockBackend("good"), port=srv.port,
+    import pq
+    from ledger import register_pq, transfer, stake_lock, next_ots
+    from money import to_watts
+    k = pq.generate()
+    c = connect(db)
+    register_pq(c, k["addr"], pq.root_of(bytes.fromhex(k["seed"])).hex())
+    transfer(c, "faucet", k["addr"], to_watts(10))
+    _n = next_ots(c, k["addr"])
+    stake_lock(c, k["addr"], to_watts(2),
+               pq.sign(k["seed"], _n, k["addr"], f"stake|{k['addr']}|{to_watts(2)}|{_n}", to_watts(2)))
+    cl = MinerClient(k["addr"], MockBackend("good"), port=srv.port,
                      model="m", price=0.02, infer=True)
     import socket
     from net import send_msg, recv_msg
