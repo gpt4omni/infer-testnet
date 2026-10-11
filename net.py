@@ -126,7 +126,35 @@ def recv_msg(f):
     line = f.readline(RECV_LIMIT)
     if not line:
         raise ConnectionError("peer closed")
-    return json.loads(line.decode())
+    if len(line) >= RECV_LIMIT or not line.endswith(b"\n"):
+        raise ValueError("frame too big or incomplete")
+    obj = json.loads(line.decode())
+    if not isinstance(obj, dict):
+        raise ValueError("RPC frame must be an object")
+    return obj
+
+
+def peer_address(peer):
+    host, port = peer.rsplit(":", 1)
+    if not host or ":" in host or not 1 <= int(port) <= 65535:
+        raise ValueError("peer must be an IPv4 address or hostname with port 1..65535")
+    return host, int(port)
+
+
+def gateway_rpc(peer, obj, pin="", timeout=20):
+    """Pinned PQ RPC, or explicit plaintext for the local demos."""
+    host, port = peer_address(peer)
+    if pin:
+        import pqchannel
+        pub = pqchannel.fetch_server_key(host, port, timeout)
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        s = pqchannel.client_connect(raw, pub, pin) if pin else raw
+        with s, s.makefile("rwb") as f:
+            send_msg(f, obj)
+            return recv_msg(f)
+    finally:
+        raw.close()
 
 
 class GatewayServer:
@@ -137,7 +165,7 @@ class GatewayServer:
                  block_reward=5_000_000, empty_every=30, pq=False,
                  kem_path="gateway-kem.pem"):
         from eval import TASKS
-        from chain import Chain, load_chain
+        from chain import load_chain
         self.conn, self.tasks = conn, list(TASKS)
         self.lock = threading.Lock()
         self.seq = 0
@@ -164,6 +192,7 @@ class GatewayServer:
         self.empty_every = empty_every
         self._idle_rounds = 0
         self.hits = {}  # ip -> deque of recent expensive-op timestamps
+        self._hits_lock = threading.Lock()
         self.challenges = {}  # challenge_id -> (challenge, expiry)
         self.checkpoint_doc = None
         import collections as _c
@@ -182,11 +211,7 @@ class GatewayServer:
         self.D1_GOOD = 0.5  # at/above: preferred
         self.ACTIVE_TTL = 120  # seconds a miner counts as connected
         self.MIN_INFER_STAKE_WATTS = 1_000_000  # 1 INFR locked to serve paid infer (Sybil toll)
-        try:
-            self.chain = load_chain(chain_path)
-        except ValueError as e:
-            print(f"chain load failed (fail-closed): {e}", flush=True)
-            self.chain = Chain()
+        self.chain = load_chain(chain_path)  # corrupt history must stop startup
         if self.chain.tip:
             print(f"loaded chain: height={self.chain.height} tip={self.chain.tip[:16]}..", flush=True)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -194,6 +219,9 @@ class GatewayServer:
         self.sock.bind((host, port))
         self.sock.listen(16)
         self.port = self.sock.getsockname()[1]
+        self.self_id = f"{host}:{self.port}"
+        self._connections = threading.BoundedSemaphore(128)
+        self._stop = threading.Event()
 
     def _recv_or_http(self, f, ip="local"):
         """Read one frame; serve HTTP routes (healthcheck, faucet site/API),
@@ -202,7 +230,12 @@ class GatewayServer:
         if not line:
             raise ConnectionError("peer closed")
         if line[:3] not in (b"GET", b"HEA", b"POS", b"OPT"):
-            return json.loads(line.decode())
+            if len(line) >= RECV_LIMIT or not line.endswith(b"\n"):
+                raise ValueError("frame too big or incomplete")
+            obj = json.loads(line.decode())
+            if not isinstance(obj, dict):
+                raise ValueError("RPC frame must be an object")
+            return obj
         parts = line.decode(errors="replace").split()
         method, path = (parts + ["", "/"])[:2]
         headers, body = {}, b""
@@ -523,56 +556,73 @@ class GatewayServer:
         garbage still earns nothing (scoring pays 0) and blocks cap space."""
         import collections
         import time as _t
-        now = _t.time()
-        dq = self.hits.setdefault(ip, collections.deque())
-        while dq and now - dq[0] > window:
-            dq.popleft()
-        if len(dq) >= limit:
-            return False
-        dq.append(now)
-        return True
+        with self._hits_lock:
+            now = _t.monotonic()
+            dq = self.hits.setdefault(ip, collections.deque())
+            while dq and now - dq[0] > window:
+                dq.popleft()
+            if len(dq) >= limit:
+                return False
+            dq.append(now)
+            return True
 
     def serve_forever(self):
+        while not self._stop.is_set():
+            try:
+                cs, addr = self.sock.accept()
+            except OSError:
+                if self._stop.is_set():
+                    return
+                raise
+            if not self._connections.acquire(blocking=False):
+                cs.close()
+                continue
+            threading.Thread(target=self._connection, args=(cs, addr[0]), daemon=True).start()
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+    def _connection(self, cs, ip):
         import struct as _st
         import time as _pt
-        while True:
-            cs, addr = self.sock.accept()
-            ip = addr[0] if isinstance(addr, tuple) else "local"
-            try:
-                cs.settimeout(10)
-                peek = b""
-                t0 = _pt.time()
-                while len(peek) < 6 and _pt.time() - t0 < 10:  # gather: PEEK can return partial
-                    chunk = cs.recv(6 - len(peek), socket.MSG_PEEK)
-                    if not chunk:
-                        break
-                    peek += chunk
-                cs.settimeout(None)
-            except Exception:
-                cs.close()
-                continue
+        try:
+            cs.settimeout(10)
+            deadline = _pt.monotonic() + 10
+            while True:
+                peek = cs.recv(6, socket.MSG_PEEK)  # never append: PEEK repeats the same bytes
+                if not peek:
+                    return
+                if len(peek) >= 6:
+                    break
+                if _pt.monotonic() >= deadline:
+                    raise TimeoutError("protocol prefix timeout")
+                _pt.sleep(0.01)
             if peek.startswith(b"PQKEY"):
-                try:  # key-fetch probe: serve raw KEM public key, then close
-                    cs.recv(6)
-                    import pqchannel as _pqk
-                    pub = _pqk._pub_bytes(self.kem_sk) if self.kem_sk else b""
-                    cs.sendall(_st.pack(">H", len(pub)) + pub)
-                except Exception:
-                    pass
-                cs.close()
-                continue
+                import pqchannel as _pqk
+                if _pqk._recvn_raw(cs, 6) != b"PQKEY\n":
+                    return
+                pub = _pqk._pub_bytes(self.kem_sk) if self.kem_sk else b""
+                cs.sendall(_st.pack(">H", len(pub)) + pub)
+                return
             if peek[:1] == b"\x16":
-                cs.close()  # legacy TLS hello: retired, close cleanly
-                continue
+                return  # legacy TLS hello: retired
             if self.pq and peek.startswith(b"PQ1\n"):
                 import pqchannel as _pqh
-                try:
-                    cs.recv(len(b"PQ1\n"))  # consume magic already peeked
-                    cs = _pqh.server_accept(cs, self.kem_sk)
-                except Exception:
-                    cs.close()
-                    continue
-            threading.Thread(target=self.handle, args=(cs, ip), daemon=True).start()
+                _pqh._recvn_raw(cs, 4)
+                cs = _pqh.server_accept(cs, self.kem_sk)
+            raw = cs.sock if hasattr(cs, "sock") else cs
+            raw.settimeout(120)
+            self.handle(cs, ip)
+        except (ConnectionError, OSError, ValueError, TypeError):
+            pass
+        finally:
+            cs.close()
+            self._connections.release()
 
     def handle(self, cs, ip="local"):
         from miner import sha
@@ -583,7 +633,7 @@ class GatewayServer:
                 hello = self._recv_or_http(f, ip)
                 if hello is None:  # was an HTTP healthcheck; answered already
                     return
-                if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
+                if hello.get("op") in ("get_tip", "get_block", "get_blocks", "peers", "submit_block", "mempool",
                                         "balance", "history", "next_ots", "submit_tx",
                                         "template", "get_mempool", "infer_submit", "infer_result",
                                         "feedback"):
@@ -654,7 +704,7 @@ class GatewayServer:
                                 send_msg(f, {"passed": passed, "payout_watts": pay})
                     elif not self.handle_wan(f, req, ip):
                         send_msg(f, {"ok": False, "msg": "unknown op"})
-        except (ConnectionError, json.JSONDecodeError, KeyError):
+        except (ConnectionError, OSError, ValueError, KeyError, TypeError):
             pass
 
     def handle_wan(self, f, req, ip="local"):
@@ -834,10 +884,9 @@ class GatewayServer:
                 send_msg(f, {"ok": False, "msg": str(e)[:120]})
             return True
         if op == "template":
-            from chain import retarget
             with self.lock:
                 tip, height = self.chain.tip, self.chain.height
-                bits = retarget(self.chain.path_to(tip)) if tip else self.bits
+                bits = self.chain.next_bits(tip) if tip else self.bits
             send_msg(f, {"prev_hash": tip or "00" * 32, "height": (height + 1) if tip else 0,
                          "bits": bits})
             return True
@@ -858,7 +907,24 @@ class GatewayServer:
             send_msg(f, {"jobs": jobs, "transfers": txs})
             return True
         if op == "get_tip":
-            send_msg(f, {"tip": self.chain.tip, "height": self.chain.height})
+            with self.lock:
+                send_msg(f, {"tip": self.chain.tip, "height": self.chain.height})
+            return True
+        if op == "get_blocks":
+            b, blocks, size = req.get("hash", ""), [], 128
+            limit = max(1, min(int(req.get("limit", 50)), 50))
+            with self.lock:
+                for _ in range(limit):
+                    blk = self.chain.blocks.get(b)
+                    if blk is None:
+                        break
+                    n = len(json.dumps(blk).encode()) + 2
+                    if size + n >= RECV_LIMIT - 256:
+                        break
+                    blocks.append(blk)
+                    size += n
+                    b = blk["header"]["prev_hash"] if blk["header"]["height"] else ""
+            send_msg(f, {"ok": bool(blocks), "blocks": blocks, "next": b})
             return True
         if op == "get_block":
             blk = self.chain.blocks.get(req.get("hash", ""))
@@ -873,11 +939,8 @@ class GatewayServer:
                 return True
             with self.lock:
                 ok, msg = self.chain.add(req["block"])
-                if ok:
-                    from chain import txid as _txid
+                if ok and msg != "already known":
                     self.persist(req["block"])
-                    mine_ids = {_txid(t) for t in req["block"]["txs"]}
-                    self.mempool = [m for m in self.mempool if _txid(m) not in mine_ids]
                     self.apply_tip_locked()
             send_msg(f, {"ok": ok, "msg": msg, "tip": self.chain.tip,
                          "height": self.chain.height})
@@ -951,8 +1014,10 @@ class GatewayServer:
         try:
             with open(path) as f:
                 doc = _json.load(f)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return False, f"unreadable: {e}"
+        if not isinstance(doc, dict):
+            return False, "checkpoint must be an object"
         try:
             msg = f"checkpoint|{doc['height']}|{doc['hash']}"
             ok = (doc["root"] == pinned_root and
@@ -961,6 +1026,9 @@ class GatewayServer:
             ok = False
         if not ok:
             return False, "bad checkpoint signature or wrong operator root"
+        if (int(doc["height"]) < 0 or not isinstance(doc["hash"], str) or len(doc["hash"]) != 64 or
+                any(c not in "0123456789abcdef" for c in doc["hash"])):
+            return False, "bad checkpoint height/hash"
         with self.lock:
             self.checkpoint_doc = doc
             self.chain.set_checkpoint(int(doc["height"]), doc["hash"])
@@ -1008,13 +1076,16 @@ class GatewayServer:
             save_block(f, block)
 
     def mempool_add(self, tx: dict) -> tuple[bool, str]:
+        with self.lock:
+            return self._mempool_add_locked(tx)
+
+    def _mempool_add_locked(self, tx):
         if len(self.mempool) >= 500:
             return False, "mempool full"
         if tx.get("type") == "transfer":
             import pq
-            with self.lock:
-                row = self.conn.execute("SELECT root_hex FROM pq_accounts WHERE addr=?",
-                                        (tx["from"],)).fetchone()
+            row = self.conn.execute("SELECT root_hex FROM pq_accounts WHERE addr=?",
+                                    (tx["from"],)).fetchone()
             if row is None:
                 return False, "unknown PQ sender"
             if not pq.verify(tx["from"], row[0], tx["sig"], tx["to"], tx["amount"]):
@@ -1023,27 +1094,25 @@ class GatewayServer:
                 ots = int(tx["sig"]["ots"])
             except (KeyError, TypeError, ValueError):
                 return False, "bad OTS index"
-            with self.lock:
+            used = self.conn.execute(
+                "SELECT 1 FROM transfers WHERE from_id=? AND ots=?", (tx["from"], ots)).fetchone()
+            if not used and self._has_ots():
                 used = self.conn.execute(
-                    "SELECT 1 FROM transfers WHERE from_id=? AND ots=?", (tx["from"], ots)).fetchone()
-                if not used and self._has_ots():
-                    used = self.conn.execute(
-                        "SELECT 1 FROM ots_used WHERE addr=? AND ots=?", (tx["from"], ots)).fetchone()
-                if not used:
-                    used = any(m.get("from") == tx["from"] and
-                               int(m.get("sig", {}).get("ots", -1)) == ots for m in self.mempool)
-                if used:
-                    return False, f"OTS #{ots} already spent or queued — wallet must use a fresh index"
+                    "SELECT 1 FROM ots_used WHERE addr=? AND ots=?", (tx["from"], ots)).fetchone()
+            if not used:
+                used = any(m.get("from") == tx["from"] and
+                           int(m.get("sig", {}).get("ots", -1)) == ots for m in self.mempool)
+            if used:
+                return False, f"OTS #{ots} already spent or queued — wallet must use a fresh index"
         elif tx.get("type") not in ("job",):
             return False, "only transfer/job relayed (mint/slash are protocol)"
-        with self.lock:
-            self.mempool.append(tx)
+        self.mempool.append(tx)
         return True, "queued (unconfirmed)"
 
     def mine_round(self) -> dict | None:
         """Assemble + mine one block. Slow PoW runs WITHOUT the lock.
         Coinbase (capped protocol mint) is always tx[0] when reward set."""
-        from chain import mine_block, retarget, header_hash
+        from chain import mine_block, header_hash
         with self.lock:
             txs = self.mempool[:200]
             tip, height = self.chain.tip, self.chain.height
@@ -1053,24 +1122,24 @@ class GatewayServer:
                 if self._idle_rounds < self.empty_every:
                     return None
                 self._idle_rounds = 0
-        n_mem = len(txs)
         if tip and self.reward_addr and self.block_reward:
             from chain import split_coinbase
             txs = split_coinbase(self.block_reward, self.reward_addr, txs,
                                  height=height + 1) + txs
         if not tip:
-            txs, n_mem = [], 0  # genesis carries no user txs (consensus rule)
+            txs = []  # genesis carries no user txs (consensus rule)
             blk = mine_block("00" * 32, 0, self.bits, txs)
         else:
             with self.lock:
-                bits = retarget(self.chain.path_to(tip)) or self.bits
+                bits = self.chain.next_bits(tip)
             blk = mine_block(tip, height + 1, bits, txs)
         with self.lock:
+            if self.chain.tip != tip:
+                return None  # stale work must not evict transactions from the new tip
             ok, msg = self.chain.add(blk)
             if not ok:
                 return None
             self.persist(blk)
-            del self.mempool[:n_mem]
             self.apply_tip_locked()
         print(f"mined block {blk['header']['height']} {header_hash(blk['header'])[:12]}.. "
               f"({len(txs)} txs, tip={self.chain.height})", flush=True)
@@ -1080,7 +1149,6 @@ class GatewayServer:
         """Ledger follows the tip. Forward-apply on extension, full reindex
         on reorg. INVALID txs are SKIPPED (logged), never fatal: one bad
         transfer must not freeze the chain (lesson learned on testnet)."""
-        from chain import apply_tx
         new_tip = self.chain.tip
         if new_tip == self.applied_tip:
             return
@@ -1096,25 +1164,35 @@ class GatewayServer:
             for blk in reversed(fwd):
                 self._apply_block(blk)
         else:
+            self.conn.execute("UPDATE miners SET slashed_watts=slashed_watts-COALESCE("
+                              "(SELECT SUM(amount) FROM chain_slashes WHERE entity=miners.id AND kind='miner'),0)")
+            self.conn.execute("DELETE FROM chain_slashes")
             miners = list(self.conn.execute("SELECT * FROM miners"))
             accounts = list(self.conn.execute("SELECT * FROM pq_accounts"))
-            issued = list(self.conn.execute("SELECT * FROM transfers WHERE from_id IN ('faucet','subsidy')"))
+            self.conn.execute("CREATE TABLE IF NOT EXISTS chain_mints(txid TEXT PRIMARY KEY, transfer_id INTEGER)")
+            issued = list(self.conn.execute("SELECT * FROM transfers WHERE from_id IN ('faucet','subsidy') "
+                                            "AND id NOT IN (SELECT transfer_id FROM chain_mints)"))
             self.conn.execute("CREATE TABLE IF NOT EXISTS applied_txid(txid TEXT PRIMARY KEY)")
             self.conn.execute("DELETE FROM jobs")
             self.conn.execute("DELETE FROM transfers")
             self.conn.execute("DELETE FROM slashes")
             self.conn.execute("DELETE FROM applied_txid")
+            self.conn.execute("DELETE FROM chain_mints")
             self.conn.commit()
             for m in miners:
                 self.conn.execute("INSERT OR REPLACE INTO miners VALUES(?,?,?,?,?)", tuple(m))
             for a_ in accounts:
                 self.conn.execute("INSERT OR REPLACE INTO pq_accounts VALUES(?,?)", tuple(a_))
-            for row in issued:  # protocol issuance survives reorgs (faucet/subsidy aren't user spends)
+            for row in issued:  # only out-of-chain issuance survives; orphaned rewards do not
                 self.conn.execute("INSERT OR IGNORE INTO transfers VALUES(?,?,?,?,?,?,?)", tuple(row))
             self.conn.commit()
             for blk in self.chain.path_to(new_tip):
                 self._apply_block(blk)
         self.applied_tip = new_tip
+        from chain import txid
+        self.conn.execute("CREATE TABLE IF NOT EXISTS applied_txid(txid TEXT PRIMARY KEY)")
+        self.mempool = [t for t in self.mempool if not self.conn.execute(
+            "SELECT 1 FROM applied_txid WHERE txid=?", (txid(t),)).fetchone()]
 
     def _apply_block(self, blk):
         from chain import apply_tx
@@ -1128,70 +1206,70 @@ class GatewayServer:
 
     def start_mining(self):
         def loop():
-            import time as _t
-            while True:
-                _t.sleep(self.mine_interval)
+            while not self._stop.wait(self.mine_interval):
                 try:
                     self.mine_round()
                 except Exception as e:
                     print(f"mine round failed: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
-    def start_peer_sync(self, peers: list[str], interval: int = 30, max_depth: int = 50):
-        """Pull heavier tips from peer gateways; validate + apply locally.
-        Plain TCP (LAN/testnet); untrusted data, fully revalidated on receipt
-        (PoW, merkle, money rules, reorg cap, checkpoints all still apply)."""
-        import socket as _s
-        import time as _st
+    def sync_peer(self, peer, pin="", max_depth=10000):
+        """Fetch bounded batches backwards, then validate forward. Height is not work."""
+        from chain import header_hash
+        t = gateway_rpc(peer, {"op": "get_tip"}, pin)
+        h, blocks, size = t["tip"], [], 0
+        with self.lock:
+            if not h or h == self.chain.tip:
+                return 0
+        while h:
+            with self.lock:
+                if h in self.chain.blocks:
+                    break
+            if len(blocks) >= max_depth or size >= 64 * RECV_LIMIT:
+                raise ValueError("sync budget exceeded; increase max_depth or use a nearer seed")
+            r = gateway_rpc(peer, {"op": "get_blocks", "hash": h,
+                                  "limit": min(50, max_depth - len(blocks))}, pin)
+            if not r.get("ok") or not r.get("blocks"):
+                raise ValueError("seed returned no blocks (upgrade both gateways)")
+            for blk in r["blocks"]:
+                if header_hash(blk["header"]) != h:
+                    raise ValueError("seed returned the wrong block hash")
+                with self.lock:
+                    if h in self.chain.blocks:
+                        break
+                blocks.append(blk)
+                size += len(json.dumps(blk).encode())
+                h = blk["header"]["prev_hash"] if blk["header"]["height"] else ""
+                if len(blocks) > max_depth or size > 64 * RECV_LIMIT:
+                    raise ValueError("sync budget exceeded")
+        added = 0
+        with self.lock:
+            for blk in reversed(blocks):
+                ok, msg = self.chain.add(blk)
+                if not ok:
+                    self.apply_tip_locked()
+                    raise ValueError(f"invalid seed block: {msg}")
+                if msg != "already known":
+                    self.persist(blk)
+                    added += 1
+            self.apply_tip_locked()
+        return added
 
-        def rpc(host, port, obj, timeout=20):
-            s = _s.create_connection((host, port), timeout=timeout)
-            with s, s.makefile("rwb") as f:
-                send_msg(f, obj)
-                return recv_msg(f)
-
-        def once():
-            for peer in peers:
-                try:
-                    host, port = peer.rsplit(":", 1)
-                    t = rpc(host, int(port), {"op": "get_tip"})
-                    if not t.get("tip") or t.get("height", -1) <= self.chain.height:
-                        continue
-                    # walk back to a hash we know (bounded)
-                    hashes, h, tip = [], t["tip"], t["tip"]
-                    for _ in range(max_depth):
-                        if h in self.chain.blocks:
-                            break
-                        r = rpc(host, int(port), {"op": "get_block", "hash": h})
-                        if not r.get("ok"):
-                            break
-                        hashes.append(r["block"])
-                        h = r["block"]["header"]["prev_hash"] if r["block"]["header"]["height"] else ""
-                        if not h or set(h) == {"0"}:
-                            break
-                    else:
-                        continue
-                    added = 0
-                    with self.lock:
-                        for blk in reversed(hashes):
-                            ok, _ = self.chain.add(blk)
-                            if ok:
-                                self.persist(blk)
-                                added += 1
-                        if added:
-                            self.apply_tip_locked()
-                    if added:
-                        print(f"synced {added} blocks from {peer} (tip={self.chain.height})", flush=True)
-                except (ConnectionError, OSError, ValueError, KeyError):
-                    continue
+    def start_peer_sync(self, peers: list[str], interval: int = 30, max_depth: int = 10000,
+                        pins=None):
+        pins = pins or {}
 
         def loop():
-            while True:
-                _st.sleep(interval)
-                try:
-                    once()
-                except Exception as e:
-                    print(f"peer sync failed: {e}", flush=True)
+            while not self._stop.is_set():
+                for peer in peers:
+                    try:
+                        added = self.sync_peer(peer, pins.get(peer, ""), max_depth)
+                        if added:
+                            print(f"synced {added} blocks from {peer} (tip={self.chain.height})", flush=True)
+                    except (ConnectionError, OSError, ValueError, KeyError, TypeError) as e:
+                        print(f"peer sync {peer}: {e}", flush=True)
+                if self._stop.wait(interval):
+                    return
         threading.Thread(target=loop, daemon=True).start()
 
 

@@ -42,11 +42,11 @@ def server_keypair(path: str = KEM_FILE):
             sk = cls.from_seed_bytes(f.read())
     else:
         sk = cls.generate()
-        with open(path, "wb") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
             f.write(sk.private_bytes(serialization.Encoding.Raw,
                                      serialization.PrivateFormat.Raw,
                                      serialization.NoEncryption()))
-        os.chmod(path, 0o600)
     pin = hashlib.sha256(_pub_bytes(sk)).hexdigest()
     return sk, pin
 
@@ -160,9 +160,7 @@ class _Lines:
 def server_accept(raw_sock, server_sk) -> Channel:
     """Server side: magic already consumed. Receive encapsulation, decapsulate."""
     # client -> server: [2B kem-ct-len][kem-ct 1088B][32B client nonce part]
-    hdr = raw_sock.recv(2)
-    if len(hdr) < 2:
-        raise ConnectionError("peer closed")
+    hdr = _recvn_raw(raw_sock, 2)
     (ln,) = struct.unpack(">H", hdr)
     if ln != 1088:
         raise ValueError("bad kem ciphertext length")

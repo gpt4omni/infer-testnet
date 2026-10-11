@@ -1,0 +1,38 @@
+name: demo-regressions
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  demos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run consensus, PQ, onboarding and ledger proofs
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+
+          demos = [
+              "demo.py", "demo_money.py", "demo_chain.py", "demo_gossip.py",
+              "demo_security.py", "demo_blocks.py", "demo_p2p.py", "demo_wan.py",
+              "demo_lightning.py", "demo_collusion.py", "demo_verify_attacks.py",
+              "demo_verify_hard.py", "demo_chain_fast.py", "demo_ledger_replay.py",
+              "demo_pqchannel.py", "demo_onboarding.py",
+          ]
+          for name in demos:
+              print(f"Running {name}", flush=True)
+              subprocess.run([sys.executable, name], check=True, timeout=180)
+          print(f"PASS: {len(demos)} demos", flush=True)
+          PY

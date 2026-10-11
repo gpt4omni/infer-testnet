@@ -118,21 +118,30 @@ def sign(seed_hex: str, ots: int, from_addr: str, to_addr: str, amount: int) -> 
             "pk": [p.hex() for p in pk]}
 
 
+def signature_root(pkg: dict) -> str:
+    """Recover the public Merkle root; callers must still verify the signature."""
+    path = [bytes.fromhex(s) for s in pkg["path"]]
+    pk = [bytes.fromhex(s) for s in pkg["pk"]]
+    ots = int(pkg["ots"])
+    if (not 0 <= ots < NKEYS or len(path) != HEIGHT or len(pk) != LEN or
+            any(len(p) != N for p in path + pk)):
+        raise ValueError("bad WOTS public key or Merkle path")
+    node, j = _h(b"leaf", _wots_pk_hash(pk)), ots
+    for sib in path:
+        node = _h(b"node", sib, node) if j & 1 else _h(b"node", node, sib)
+        j //= 2
+    return node.hex()
+
+
 def verify(from_addr: str, root_hex: str, pkg: dict, to_addr: str, amount: int) -> bool:
     try:
         sig = [bytes.fromhex(s) for s in pkg["sig"]]
-        path = [bytes.fromhex(s) for s in pkg["path"]]
         pk = [bytes.fromhex(s) for s in pkg["pk"]]
         ots = int(pkg["ots"])
-        if not 0 <= ots < NKEYS or len(path) != HEIGHT:
+        if any(len(s) != N for s in sig):
             return False
         if not _wots_verify(sig, _msg(from_addr, to_addr, amount, ots), pk):
             return False
-        node = _h(b"leaf", _wots_pk_hash(pk))
-        j = ots
-        for sib in path:
-            node = _h(b"node", sib, node) if j & 1 else _h(b"node", node, sib)
-            j //= 2
-        return node.hex() == root_hex and address_of(bytes.fromhex(root_hex)) == from_addr
+        return signature_root(pkg) == root_hex and address_of(bytes.fromhex(root_hex)) == from_addr
     except (ValueError, KeyError, TypeError):
         return False

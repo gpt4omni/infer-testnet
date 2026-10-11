@@ -32,18 +32,11 @@ def mine_forever(a):
     """Open block production: pull template + mempool, assemble split
     coinbase to own key, grind PoW, submit. Anyone can do this — that is
     what makes production permissionless instead of operator-only."""
-    import socket
     import time as _t
-    from net import send_msg, recv_msg
-    from money import fmt_watts
-    host, port = a.gateway.rsplit(":", 1)
-    port = int(port)
+    from net import gateway_rpc
 
     def rpc(obj, timeout=30):
-        s = socket.create_connection((host, port), timeout=timeout)
-        with s, s.makefile("rwb") as f:
-            send_msg(f, obj)
-            return recv_msg(f)
+        return gateway_rpc(a.gateway, obj, "" if a.no_tls else a.pin, timeout)
 
     from chain import mine_block, split_coinbase, MAX_BLOCK_REWARD_WATTS
     key = load_keyfile(a.keyfile)
@@ -82,7 +75,7 @@ def mine_forever(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gateway", required=True, help="host:port")
-    ap.add_argument("--pin", default="", help="gateway cert pin (required for TLS)")
+    ap.add_argument("--pin", default="", help="gateway KEM pin (required for PQ transport)")
     ap.add_argument("--no-tls", action="store_true", help="plaintext (loopback tests only)")
     ap.add_argument("--keyfile", required=True)
     ap.add_argument("--backend", default="mock", choices=["mock", "cheat", "gpu"])
@@ -108,6 +101,8 @@ def main():
         be, model = MockBackend("good"), "mock-7b"
 
     from money import fmt_watts
+    if not a.no_tls and not a.pin:
+        raise SystemExit("--pin required (gateway prints its KEM pin at startup)")
     if a.mine:
         mine_forever(a)
         return

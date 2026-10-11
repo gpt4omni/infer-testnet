@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WAN proof: gateway + 2 miners as SEPARATE OS processes over TLS sockets
+"""WAN proof: gateway + 2 miners as SEPARATE OS processes over PQ sockets
 with PQ-signed submits. Loopback here; same binaries run across LAN/WAN."""
 import json
 import os
@@ -29,7 +29,8 @@ def main():
 
     gw = subprocess.Popen(
         [sys.executable, "gateway_node.py", "--host", "127.0.0.1", "--port", str(PORT),
-         "--db", os.path.join(D, "gateway.db"), "--chain", os.path.join(D, "chain.dat"), "--tls"],
+         "--db", os.path.join(D, "gateway.db"), "--chain", os.path.join(D, "chain.dat"), "--tls",
+         "--mine", "--mine-interval", "1", "--bits", hex(2 ** 248)],
         cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     pin = None
     t0 = time.time()
@@ -69,8 +70,14 @@ def main():
             out = p.communicate(timeout=300)[0]
             print(f"--- {name} ---\n{out}")
             assert p.returncode == 0, f"{name} failed"
+        from net import gateway_rpc
+        deadline = time.monotonic() + 30
+        while gateway_rpc(f"127.0.0.1:{PORT}", {"op": "mempool"}, pin)["queued"]:
+            assert time.monotonic() < deadline, "jobs did not settle into blocks"
+            time.sleep(0.2)
     finally:
         gw.terminate()
+        gw.wait(timeout=10)
 
     from ledger import connect, balance_watts
     from money import fmt_watts
@@ -79,7 +86,7 @@ def main():
     bc = balance_watts(c, keys["m-cheat"]["addr"])
     print(f"gateway ledger: good={fmt_watts(bg)} cheat={fmt_watts(bc)}")
     assert bg > 0 and bc == 0
-    print("WAN DEMO PASS: separate processes, TLS, signed submits.")
+    print("WAN DEMO PASS: separate processes, ML-KEM, signed submits, block settlement.")
 
 
 if __name__ == "__main__":

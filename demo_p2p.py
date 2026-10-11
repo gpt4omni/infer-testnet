@@ -2,6 +2,7 @@
 """Two miners, one gateway, real TCP: honest earns over the wire, cheat earns 0."""
 import os
 import sys
+import tempfile
 import threading
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -25,13 +26,19 @@ def client(name, kind, n, out, port=19191):
 
 
 def main():
+    with tempfile.TemporaryDirectory(prefix="infer-p2p-") as directory:
+        run_proof(directory)
+
+
+def run_proof(directory):
     import sys as _sys
-    port = int(_sys.argv[1]) if len(_sys.argv) > 1 else 19191
+    port = int(_sys.argv[1]) if len(_sys.argv) > 1 else 0
     if os.path.exists(DB):
         os.remove(DB)
     c = connect(DB)
     srv = GatewayServer(connect(DB, check_same_thread=False), port=port,
-                        chain_path="/tmp/opencode/p2p-chain.dat")
+                        chain_path=os.path.join(directory, "chain.dat"))
+    port = srv.port
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     rows: list = []
@@ -48,6 +55,9 @@ def main():
     print(f"net-cheat balance: {fmt_watts(balance_watts(c, 'net-cheat'))}")
     assert balance_watts(c, "net-good") > 0 and balance_watts(c, "net-cheat") == 0
     print("P2P OK: wire transport, same scoring, cheat still earns 0.")
+    srv.close()
+    srv.conn.close()
+    c.close()
 
 
 if __name__ == "__main__":

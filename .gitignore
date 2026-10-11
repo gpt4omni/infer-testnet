@@ -13,3 +13,4 @@ chaindemo/
 *-wal
 *-shm
 *-journal
+.venv/

@@ -3,6 +3,7 @@
 Attacker has MORE hashpower than the honest chain in every drill."""
 import os
 import sys
+import tempfile
 import time
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -50,13 +51,14 @@ def main():
 
     # 3. checkpoint: pin height 5, heavier fork below it refused
     import subprocess
-    keyf = "/tmp/opencode/cp-op.json"
     import json as _j
     k = pq.generate()
-    _j.dump(k, open(keyf, "w"))
     cp_hash = C.header_hash(ch.path_to(ch.tip)[5]["header"])
-    r = subprocess.run([sys.executable, "checkpoint_tool.py", keyf, "5", cp_hash],
-                       capture_output=True, text=True, cwd=os.path.dirname(__file__))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as keyfile:
+        _j.dump(k, keyfile)
+        keyfile.flush()
+        r = subprocess.run([sys.executable, "checkpoint_tool.py", keyfile.name, "5", cp_hash],
+                           capture_output=True, text=True, cwd=os.path.dirname(__file__))
     assert r.returncode == 0, r.stderr
     doc = _j.loads(r.stdout)
     ch2 = C.Chain()
@@ -84,6 +86,12 @@ def main():
     evil = dict(doc, hash="00" * 32)
     assert not pq.verify(evil["addr"], evil["root"], evil["sig"], "checkpoint|5|" + "00" * 32, 5)
     print("drill 4 CAUGHT: forged checkpoint fails PQ verify")
+    cold = C.Chain()
+    cold.set_checkpoint(5, cp_hash)
+    for b in ch.path_to(ch.tip):
+        assert cold.add(b)[0]
+    assert cold.tip == ch.tip and cold.verify()[0], "checkpoint stopped valid cold sync"
+    print("drill 5 PASS: checkpoint installed before cold sync permits the pinned history")
     print("SECURITY DRILLS PASS.")
 
 

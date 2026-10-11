@@ -22,6 +22,10 @@ Then:
 Wallet flags: `--profile NAME` (separate wallets), `--gateway HOST:PORT`
 `--pin ...` / `--no-tls` (network mode instead of local).
 
+For gateway seed sync and a second LAN operator, see [ONBOARDING.md](ONBOARDING.md).
+Gateway `--pq` (also `--tls`) uses ML-KEM, not classical TLS. Exchange KEM pins
+independently before connecting.
+
 ## Bundles (maintainers)
 
 Linux one-dir bundle (tested): `pyinstaller -y wallet.spec` → `dist/`.

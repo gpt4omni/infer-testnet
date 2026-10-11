@@ -11,15 +11,19 @@ reset. Do not put real money or real secrets in it.
 
 Gateway (mines blocks, serves API + faucet + explorer):
 
-    python3 gateway_node.py --host 0.0.0.0 --port 19191 --db gateway.db \
+    python3 gateway_node.py --host 0.0.0.0 --port 19191 --db gateway.db --pq \
       --mine --reward-addr <your-pq1-address>
 
 Miner (serves jobs; add `--mine` to also produce blocks):
 
-    python3 miner_node.py --gateway HOST:PORT --keyfile mine.json --jobs 0
+    python3 miner_node.py --gateway HOST:PORT --pin KEM_PIN --keyfile mine.json --jobs 0
 
 Desktop wallet (needs Tk): `./wallet.sh`. Web wallet + faucet + explorer
 are served by the gateway itself: `/wallet`, `/`, `/blocks`.
+
+Second operator: see [ONBOARDING.md](ONBOARDING.md) for independent KEM pins,
+`--seed HOST:PORT@PIN`, firewall steps, standby sync, and the two-host
+convergence command. `python demo_onboarding.py` runs its local process proof.
 
 ## Money
 
