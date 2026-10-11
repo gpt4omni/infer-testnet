@@ -134,7 +134,8 @@ class GatewayServer:
                  cert_path="gateway-cert.pem", key_path="gateway-key.pem",
                  peers=(), block_mode=False, chain_path="chain.dat",
                  bits=2 ** 236, mine_interval=15, reward_addr="",
-                 block_reward=5_000_000, empty_every=30):
+                 block_reward=5_000_000, empty_every=30, pq=False,
+                 kem_path="gateway-kem.pem"):
         from eval import TASKS
         from chain import Chain, load_chain
         self.conn, self.tasks = conn, list(TASKS)
@@ -143,6 +144,14 @@ class GatewayServer:
         self.peers = list(peers)
         self.self_id = f"{host}:{port}"
         self.tls, self.ctx = tls, None
+        # PQ transport (ML-KEM-768 + AES-256-GCM). --tls maps here too:
+        # the old ECDSA-TLS path is retired (Shor-vulnerable), same UX.
+        self.pq = pq or tls
+        self.kem_sk, self.kem_pin = None, ""
+        if self.pq:
+            import pqchannel as _pq
+            self.kem_sk, self.kem_pin = _pq.server_keypair(kem_path)
+            print(f"PQ channel on, kem pin: {self.kem_pin}", flush=True)
         # block mode: submits queue in mempool, settle ONLY via mined blocks
         self.block_mode = block_mode
         self.chain_path = chain_path
@@ -185,12 +194,6 @@ class GatewayServer:
         self.sock.bind((host, port))
         self.sock.listen(16)
         self.port = self.sock.getsockname()[1]
-        if tls:
-            fp = ensure_cert(cert_path, key_path)
-            import ssl
-            self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            self.ctx.load_cert_chain(cert_path, key_path)
-            print(f"TLS on, cert fingerprint (pin): {fp}", flush=True)
 
     def _recv_or_http(self, f, ip="local"):
         """Read one frame; serve HTTP routes (healthcheck, faucet site/API),
@@ -530,12 +533,42 @@ class GatewayServer:
         return True
 
     def serve_forever(self):
+        import struct as _st
+        import time as _pt
         while True:
             cs, addr = self.sock.accept()
             ip = addr[0] if isinstance(addr, tuple) else "local"
-            if self.tls:
+            try:
+                cs.settimeout(10)
+                peek = b""
+                t0 = _pt.time()
+                while len(peek) < 6 and _pt.time() - t0 < 10:  # gather: PEEK can return partial
+                    chunk = cs.recv(6 - len(peek), socket.MSG_PEEK)
+                    if not chunk:
+                        break
+                    peek += chunk
+                cs.settimeout(None)
+            except Exception:
+                cs.close()
+                continue
+            if peek.startswith(b"PQKEY"):
+                try:  # key-fetch probe: serve raw KEM public key, then close
+                    cs.recv(6)
+                    import pqchannel as _pqk
+                    pub = _pqk._pub_bytes(self.kem_sk) if self.kem_sk else b""
+                    cs.sendall(_st.pack(">H", len(pub)) + pub)
+                except Exception:
+                    pass
+                cs.close()
+                continue
+            if peek[:1] == b"\x16":
+                cs.close()  # legacy TLS hello: retired, close cleanly
+                continue
+            if self.pq and peek.startswith(b"PQ1\n"):
+                import pqchannel as _pqh
                 try:
-                    cs = self.ctx.wrap_socket(cs, server_side=True)
+                    cs.recv(len(b"PQ1\n"))  # consume magic already peeked
+                    cs = _pqh.server_accept(cs, self.kem_sk)
                 except Exception:
                     cs.close()
                     continue
@@ -551,7 +584,7 @@ class GatewayServer:
                 if hello is None:  # was an HTTP healthcheck; answered already
                     return
                 if hello.get("op") in ("get_tip", "get_block", "peers", "submit_block", "mempool",
-                                        "balance", "history", "next_ots", "register_pq", "submit_tx",
+                                        "balance", "history", "next_ots", "submit_tx",
                                         "template", "get_mempool", "infer_submit", "infer_result",
                                         "feedback"):
                     self.handle_wan(f, hello, ip)  # one-shot WAN ops, no session needed
@@ -1162,73 +1195,21 @@ class MinerClient:
 # Miner auth = PQ signatures (Shor-proof). Payloads encrypted in transit.
 # ---------------------------------------------------------------------------
 
-def ensure_cert(cert_path="gateway-cert.pem", key_path="gateway-key.pem") -> str:
-    """Create self-signed ECDSA cert on first run. Returns hex fingerprint."""
-    import hashlib
-    import os as _os
-    if _os.path.exists(cert_path) and _os.path.exists(key_path):
-        from cryptography import x509 as _x509
-        with open(cert_path, "rb") as f:
-            der = _x509.load_pem_x509_certificate(f.read()).public_bytes(
-                __import__("cryptography.hazmat.primitives.serialization", fromlist=["x"]).Encoding.DER)
-        return hashlib.sha256(der).hexdigest()
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-    import datetime
-    sk = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "infer-testnet-gateway")])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
-            .public_key(sk.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=825))
-            .sign(sk, hashes.SHA256()))
-    with open(key_path, "wb") as f:
-        f.write(sk.private_bytes(serialization.Encoding.PEM,
-                                 serialization.PrivateFormat.TraditionalOpenSSL,
-                                 serialization.NoEncryption()))
-    _os.chmod(key_path, 0o600)
-    with open(cert_path, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
-    import hashlib as _hl
-    return _hl.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
-
-
-def tls_connect(host: str, port: int, pin: str, timeout=15):
-    """TLS to gateway, verifying the pinned cert fingerprint (TOFU).
-    First connect: operator confirms the pin out-of-band (printed by the
-    gateway at startup). Wrong pin = abort, no secrets sent."""
-    import hashlib
-    import socket as _s
-    import ssl
-    raw = _s.create_connection((host, port), timeout=timeout)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        tls = ctx.wrap_socket(raw, server_hostname=host)
-        der = tls.getpeercert(binary_form=True)
-    except Exception:
-        raw.close()
-        raise
-    got = hashlib.sha256(der).hexdigest()
-    if got != pin.lower():
-        tls.close()
-        raise ValueError(f"cert pin mismatch (possible MITM): got {got[:16]}.., want {pin[:16]}..")
-    return tls
-
 
 class WANMiner:
-    """WAN client: pinned-TLS transport + PQ-signed submits."""
+    """WAN client: ML-KEM-768 pinned channel + PQ-signed submits. No ECDSA/TLS anywhere."""
 
     def __init__(self, key: dict, backend, host, port, pin, model="?", price=0.0, infer=False):
         import pq
+        import socket as _s
+        import pqchannel as _pq
         self.key, self.backend = key, backend
         self.mid = key["addr"]
         self.ots = 0  # local counter; server is source of truth on collisions
-        tls = tls_connect(host, port, pin)
-        self.sock, self.f = tls, tls.makefile("rwb")
+        pub = _pq.fetch_server_key(host, port)
+        raw = _s.create_connection((host, port), timeout=15)
+        ch = _pq.client_connect(raw, pub, pin)
+        self.sock, self.f = ch, ch.makefile("rwb")
         send_msg(self.f, {"op": "register_pq", "addr": self.mid,
                           "root_hex": pq.root_of(bytes.fromhex(key["seed"])).hex()})
         r = recv_msg(self.f)

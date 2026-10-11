@@ -41,12 +41,22 @@ def paths(profile: str):
 
 
 def _fernet(password: str, salt: bytes):
+    """v1 (legacy Fernet/AES-128): read-only path for migrating old files."""
     import base64
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.fernet import Fernet
     raw = PBKDF2HMAC(hashes.SHA256(), 32, salt, 600_000).derive(password.encode())
     return Fernet(base64.urlsafe_b64encode(raw))
+
+
+def _lock_v2(password: str, salt: bytes):
+    """AES-256-GCM with memory-hard scrypt. ~128-bit post-quantum strength
+    (Grover halves 256); v1's AES-128 gave ~64-bit. Notably heavier to brute."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    raw = Scrypt(salt=salt, length=32, n=2 ** 15, r=8, p=1).derive(password.encode())
+    return AESGCM(raw)
 
 
 def _ask_password(prompt: str) -> str | None:
@@ -66,6 +76,14 @@ def load_key(keyfile=None):
     if os.path.exists(kf):
         with open(kf) as f:
             data = json.load(f)
+        if data.get("v") == 2:
+            pw = _ask_password("Wallet password:")
+            if not pw:
+                raise SystemExit("password required")
+            f_ = _lock_v2(pw, bytes.fromhex(data["salt"]))
+            nonce = bytes.fromhex(data["nonce"])
+            raw = f_.decrypt(nonce, bytes.fromhex(data["ct"]), data["addr"].encode())
+            return json.loads(raw.decode()), pw
         if "enc" not in data:  # legacy plaintext -> encrypt now
             pw = _ask_password("Set a password for your wallet key:")
             if not pw:
@@ -75,8 +93,11 @@ def load_key(keyfile=None):
         pw = _ask_password("Wallet password:")
         if not pw:
             raise SystemExit("password required")
+        # v1 file: decrypt legacy, re-encrypt v2 on the spot (migration)
         f_ = _fernet(pw, bytes.fromhex(data["salt"]))
-        return json.loads(f_.decrypt(data["enc"].encode()).decode()), pw
+        key = json.loads(f_.decrypt(data["enc"].encode()).decode())
+        save_key(key, pw, kf)
+        return key, pw
     pw = _ask_password("Set a password for your NEW wallet key:")
     if not pw:
         raise SystemExit("password required to create wallet")
@@ -93,9 +114,12 @@ def save_key(key: dict, password: str | None, keyfile=None):
     else:
         import secrets as _secrets
         salt = _secrets.token_bytes(16)
-        tok = _fernet(password, salt).encrypt(json.dumps(key).encode()).decode()
+        nonce = _secrets.token_bytes(12)
+        ct = _lock_v2(password, salt).encrypt(nonce, json.dumps(key).encode(),
+                                              key["addr"].encode()).hex()
         with open(kf, "w") as f:
-            json.dump({"enc": tok, "salt": salt.hex(), "addr": key["addr"]}, f)
+            json.dump({"v": 2, "salt": salt.hex(), "nonce": nonce.hex(),
+                       "ct": ct, "addr": key["addr"]}, f)
     os.chmod(kf, 0o600)
 
 
@@ -262,8 +286,10 @@ class Wallet:
         import socket
         from net import send_msg, recv_msg
         if self.gw.get("tls"):
-            from net import tls_connect
-            s = tls_connect(self.gw["host"], self.gw["port"], self.gw["pin"], timeout)
+            import pqchannel as _pq
+            pub = _pq.fetch_server_key(self.gw["host"], self.gw["port"])
+            raw = socket.create_connection((self.gw["host"], self.gw["port"]), timeout=timeout)
+            s = _pq.client_connect(raw, pub, self.gw["pin"])
         else:
             s = socket.create_connection((self.gw["host"], self.gw["port"]), timeout=timeout)
         with s, s.makefile("rwb") as f:
@@ -543,8 +569,9 @@ class Wallet:
                     out, miner = res.get("output", ""), res.get("miner", "")
                     if res.get("paid_watts"):
                         paid_txt = f" auto-paid {fmt_watts(res['paid_watts'])}"
-                    elif res.get("d1_quality") is not None:
-                        paid_txt = f" d1={res['d1_quality']:.2f} below pay line — miner unpaid"
+                    else:
+                        paid_txt = " " + str(res.get("pay_note") or
+                                            (f"d1={res['d1_quality']:.2f}" if res.get("d1_quality") is not None else "unscored"))
                     break
             if out is None:
                 self.events.put(("pgfail", "no miner served it in time"))

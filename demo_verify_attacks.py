@@ -5,13 +5,11 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
-from coincurve import PrivateKey
-
 from ledger import connect, register_miner
 from miner import MockBackend
 from money import to_watts, fmt_watts
 from verify import (CommitStore, commit, redundant_check, FingerprintDB,
-                    sign_output, verify_output, open_challenge)
+                    make_watermark_key, sign_output, verify_output, open_challenge)
 
 DB = os.path.join(os.path.dirname(__file__), "ledger-verify.db")
 
@@ -52,10 +50,10 @@ def main():
     print(f"slash recorded: {row[0]} {fmt_watts(row[1])}")
 
     print("--- D: cross-job replay (signed output reused on new job) ---")
-    sk = PrivateKey()
-    sig = sign_output(sk, "job-1", honest_out)
-    ok_old = verify_output(sk.public_key.format(compressed=True), sig, "job-1", honest_out)
-    ok_new = verify_output(sk.public_key.format(compressed=True), sig, "job-2", honest_out)
+    wk = make_watermark_key()
+    sig = sign_output(wk, "job-1", honest_out)
+    ok_old = verify_output(sig, "job-1", honest_out)
+    ok_new = verify_output(sig, "job-2", honest_out)
     print(f"original job verifies: {ok_old} (must be True); replayed job verifies: {ok_new} (must be False)")
     assert ok_old and not ok_new
 

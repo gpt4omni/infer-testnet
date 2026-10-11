@@ -28,8 +28,7 @@ import hashlib
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-
-from coincurve import PrivateKey, PublicKey
+import pq
 
 from eval import TASKS, check
 from miner import sha
@@ -98,14 +97,36 @@ class FingerprintDB:
         return frac >= threshold, frac
 
 
-def sign_output(sk: PrivateKey, job_id: str, output: str) -> bytes:
-    return sk.sign(f"{job_id}|{output}".encode())
+def make_watermark_key() -> dict:
+    """Hash-based output signer (Shor-proof). One OTS index per signature;
+    256 per key, then rotate. Demo-grade rotation: make a new key."""
+    seed = __import__("secrets").token_bytes(32)
+    root = pq.root_of(seed)
+    return {"seed": seed.hex(), "root": root.hex(),
+            "addr": pq.address_of(root), "next": 0}
 
 
-def verify_output(pk_bytes: bytes, sig: bytes, job_id: str, output: str) -> bool:
+def _watermark_msg(job_id: str, output: str) -> tuple[str, int]:
+    body = f"{job_id}|{output}"
+    return body, max(1, len(body.encode()))
+
+
+def sign_output(key: dict, job_id: str, output: str) -> dict:
+    body, amt = _watermark_msg(job_id, output)
+    if key["next"] >= pq.NKEYS:
+        raise ValueError("watermark key exhausted — rotate")
+    pkg = pq.sign(key["seed"], key["next"], key["addr"], body, amt)
+    pkg["root"] = key["root"]
+    pkg["addr"] = key["addr"]
+    key["next"] += 1
+    return pkg
+
+
+def verify_output(pkg: dict, job_id: str, output: str) -> bool:
     try:
-        return PublicKey(pk_bytes).verify(sig, f"{job_id}|{output}".encode())
-    except Exception:
+        body, amt = _watermark_msg(job_id, output)
+        return pq.verify(pkg["addr"], pkg["root"], pkg, body, amt)
+    except (ValueError, KeyError, TypeError):
         return False
 
 
