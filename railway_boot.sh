@@ -16,4 +16,5 @@ if [ -z "$JEV_API_KEY" ]; then
 fi
 exec python3 -u gateway_node.py --host 0.0.0.0 --port "${PORT:-19191}" \
   --db "$DATA/gateway.db" --chain "$DATA/chain.dat" \
+  --reset-state-once railway-chain-store-v2 \
   --mine --mine-interval 20 --reward-addr "$OP"

@@ -301,28 +301,48 @@ def genesis(mints: list[dict], bits: int) -> dict:
     return mine_block("00" * 32, 0, bits, [{"type": "mint", **m} for m in mints])
 
 
+def block_record(block: dict) -> bytes:
+    return (json.dumps(block, sort_keys=True) + "\n").encode()
+
+
 def save_block(f, block: dict):
-    f.write((json.dumps(block, sort_keys=True) + "\n").encode())
+    f.write(block_record(block))
 
 
-def load_chain(path: str) -> "Chain":
-    """Load + fully validate every block. Corrupt tail stops load (fail-closed)."""
+def load_chain(path: str, recover_tail=False) -> "Chain":
+    """Validate every record. Only an interrupted final write can be repaired."""
     ch = Chain()
     try:
         fh = open(path, "rb")
     except FileNotFoundError:
         return ch
+    repair, line_no = False, 0
     with fh:
-        for line in fh:
-            line = line.strip()
+        while True:
+            offset, line = fh.tell(), fh.readline()
             if not line:
+                break
+            line_no += 1
+            terminated = line.endswith(b"\n")
+            if not line.strip():
                 continue
             try:
                 ok, msg = ch.add(json.loads(line))
+            except json.JSONDecodeError as e:
+                if recover_tail and not terminated and ch.tip:
+                    repair = offset
+                    break
+                raise ValueError(f"chain.dat corrupt at record {line_no}, byte {offset}: {e}") from e
             except (ValueError, TypeError, KeyError) as e:
-                raise ValueError(f"chain.dat corrupt: {e}") from e
+                raise ValueError(f"chain.dat corrupt at record {line_no}, byte {offset}: {e}") from e
             if not ok:
-                raise ValueError(f"chain.dat corrupt: {msg}")
+                raise ValueError(f"chain.dat corrupt at record {line_no}, byte {offset}: {msg}")
+            if not terminated and recover_tail:
+                repair = None
+    if repair is not False:
+        from storage import repair_tail
+        backup = repair_tail(path, repair)
+        print(f"recovered interrupted chain tail: height={ch.height}; original saved at {backup}", flush=True)
     return ch
 
 

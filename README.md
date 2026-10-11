@@ -24,6 +24,8 @@ are served by the gateway itself: `/wallet`, `/`, `/blocks`.
 Second operator: see [ONBOARDING.md](ONBOARDING.md) for independent KEM pins,
 `--seed HOST:PORT@PIN`, firewall steps, standby sync, and the two-host
 convergence command. `python demo_onboarding.py` runs its local process proof.
+Persistent storage/reset behavior is also documented there; Railway performs
+the explicitly configured `railway-chain-store-v2` reset once, retaining keys.
 
 ## Money
 

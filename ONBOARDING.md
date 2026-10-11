@@ -143,6 +143,34 @@ must be confirmed by the operators. Its default run is explicitly a
 - **Corrupt chain file:** startup fails without replacing history. Preserve
   the original data and investigate/recover from a known-good backup.
 
+## Persistent storage and Railway reset
+
+`gateway_node.py` holds an exclusive `chain.dat.lock` for its whole lifetime.
+A second gateway using the same chain file is refused, including during a
+reset. Block records are written completely and fsynced before their ledger
+effects are committed. A disk write/fsync failure stops the gateway instead
+of allowing it to append more records after a failed write.
+
+On restart, the runner can repair an interrupted **final, unterminated** JSON
+record if an already-validated chain prefix exists. It saves the original
+file as `chain.dat.torn-*.bak` before truncating that tail. A complete valid
+block missing just its final newline gets the newline restored. Invalid
+complete records, interior corruption, and invalid PoW/Merkle/money rules
+still stop startup; they are never skipped.
+
+Railway's boot script includes the explicit one-time reset tag
+`railway-chain-store-v2`. The first deployment with this tag archives the
+old `chain.dat`, `gateway.db`, and SQLite WAL/SHM/journal files together, then
+starts a fresh testnet. **Old testnet balances/history reset.** `operator.json`
+and KEM/wallet keys stay in place. The durable
+`chain.dat.reset-railway-chain-store-v2.done` marker prevents a second reset
+on redeploy/restart. Archived files live under `state-reset-railway-chain-store-v2-*`
+inside the same data volume.
+
+Other operators get this behavior only by explicitly supplying
+`--reset-state-once TAG`. Use a new tag only for an intentional new testnet
+reset. Keep the marker and chain on the persistent volume.
+
 ## Regression proofs
 
 ```sh
@@ -155,6 +183,7 @@ python demo_gossip.py
 python demo_security.py
 python demo_blocks.py
 python demo_wan.py
+python demo_storage.py
 ```
 
 `demo_chain_fast.py` compares exact winning nonces/headers against the old
@@ -164,3 +193,7 @@ the difficulty, block format, supply schedule, and signature scheme stay the
 same. `demo_onboarding.py` exercises catch-up past 50 blocks, equal-height
 heavier forks, signed-transfer root recovery, reorg replay, independent KEM
 keys, restart balances, wrong pins, tampering, and slow connection handling.
+`demo_storage.py` additionally exercises the actual Railway boot script with
+corrupt old state, verifies that its reset happens once and retains the
+operator key, and tests torn-tail recovery, write failures, and competing
+gateway rejection.

@@ -29,7 +29,7 @@ jobs:
               "demo_security.py", "demo_blocks.py", "demo_p2p.py", "demo_wan.py",
               "demo_lightning.py", "demo_collusion.py", "demo_verify_attacks.py",
               "demo_verify_hard.py", "demo_chain_fast.py", "demo_ledger_replay.py",
-              "demo_pqchannel.py", "demo_onboarding.py",
+              "demo_pqchannel.py", "demo_onboarding.py", "demo_storage.py",
           ]
           for name in demos:
               print(f"Running {name}", flush=True)

@@ -163,7 +163,7 @@ class GatewayServer:
                  peers=(), block_mode=False, chain_path="chain.dat",
                  bits=2 ** 236, mine_interval=15, reward_addr="",
                  block_reward=5_000_000, empty_every=30, pq=False,
-                 kem_path="gateway-kem.pem"):
+                 kem_path="gateway-kem.pem", recover_tail=False):
         from eval import TASKS
         from chain import load_chain
         self.conn, self.tasks = conn, list(TASKS)
@@ -211,7 +211,7 @@ class GatewayServer:
         self.D1_GOOD = 0.5  # at/above: preferred
         self.ACTIVE_TTL = 120  # seconds a miner counts as connected
         self.MIN_INFER_STAKE_WATTS = 1_000_000  # 1 INFR locked to serve paid infer (Sybil toll)
-        self.chain = load_chain(chain_path)  # corrupt history must stop startup
+        self.chain = load_chain(chain_path, recover_tail=recover_tail)
         if self.chain.tip:
             print(f"loaded chain: height={self.chain.height} tip={self.chain.tip[:16]}..", flush=True)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -222,6 +222,7 @@ class GatewayServer:
         self.self_id = f"{host}:{self.port}"
         self._connections = threading.BoundedSemaphore(128)
         self._stop = threading.Event()
+        self.storage_error = None
 
     def _recv_or_http(self, f, ip="local"):
         """Read one frame; serve HTTP routes (healthcheck, faucet site/API),
@@ -572,12 +573,14 @@ class GatewayServer:
                 cs, addr = self.sock.accept()
             except OSError:
                 if self._stop.is_set():
-                    return
+                    break
                 raise
             if not self._connections.acquire(blocking=False):
                 cs.close()
                 continue
             threading.Thread(target=self._connection, args=(cs, addr[0]), daemon=True).start()
+        if self.storage_error:
+            raise RuntimeError("block persistence failed; gateway stopped") from self.storage_error
 
     def close(self):
         self._stop.set()
@@ -1071,9 +1074,15 @@ class GatewayServer:
 
     # -- block mode: mempool -> PoW -> tip -> ledger ----------------------
     def persist(self, block):
-        from chain import save_block
-        with open(self.chain_path, "ab") as f:
-            save_block(f, block)
+        from storage import append_block
+        if self.storage_error:
+            raise OSError("chain store stopped after a write failure") from self.storage_error
+        try:
+            append_block(self.chain_path, block)
+        except OSError as e:
+            self.storage_error = e
+            self.close()  # never append another record after a failed/partial write
+            raise
 
     def mempool_add(self, tx: dict) -> tuple[bool, str]:
         with self.lock:

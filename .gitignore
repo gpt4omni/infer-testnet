@@ -1,5 +1,7 @@
 *.db
 *.dat
+*.dat.*
+state-reset-*/
 *.pem
 wallet-*.json
 operator.json

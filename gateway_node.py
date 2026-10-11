@@ -19,6 +19,7 @@ def main():
     ap.add_argument("--port", type=int, default=19191)
     ap.add_argument("--db", default="gateway.db")
     ap.add_argument("--chain", default="", help="chain.dat path (default: next to --db)")
+    ap.add_argument("--reset-state-once", default="", help="explicit testnet chain+ledger reset, once per tag")
     ap.add_argument("--pq", "--tls", dest="pq", action="store_true", help="ML-KEM + AES-256-GCM transport")
     ap.add_argument("--kem-key", default="", help="KEM key path (default: next to --db)")
     ap.add_argument("--show-pin", action="store_true", help="create/load KEM key, print pin, exit")
@@ -36,8 +37,7 @@ def main():
     ap.add_argument("--bits", default="", help="hex int target (default ~10s CPU blocks)")
     a = ap.parse_args()
 
-    from ledger import connect
-    from net import GatewayServer, peer_address
+    from net import peer_address
     from chain import MAX_TARGET, MAX_BLOCK_REWARD_WATTS
     if bool(a.checkpoint_file) != bool(a.checkpoint_root):
         ap.error("--checkpoint-file and --checkpoint-root must be supplied together")
@@ -79,12 +79,23 @@ def main():
         _, pin = server_keypair(kem_path)
         print(f"kem pin: {pin}", flush=True)
         return
+    from storage import chain_lock, reset_state_once
+    os.makedirs(os.path.dirname(os.path.abspath(chain_path)), exist_ok=True)
+    with chain_lock(chain_path):
+        if a.reset_state_once:
+            reset_state_once(a.db, chain_path, a.reset_state_once)
+        run_gateway(a, chain_path, kem_path, peers, pins, bits)
+
+
+def run_gateway(a, chain_path, kem_path, peers, pins, bits):
+    from ledger import connect
+    from net import GatewayServer
     conn = connect(a.db, check_same_thread=False)
     srv = None
     try:
         srv = GatewayServer(conn, host=a.host, port=a.port, pq=a.pq,
                             kem_path=kem_path, peers=peers,
-                            block_mode=True, chain_path=chain_path,
+                            block_mode=True, chain_path=chain_path, recover_tail=True,
                             bits=bits,
                             mine_interval=a.mine_interval,
                             reward_addr=a.reward_addr, block_reward=a.block_reward)
