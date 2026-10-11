@@ -13,9 +13,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def rpc(host, port, obj, timeout=20, pin=""):
     if pin:
-        from net import tls_connect
-        s = tls_connect(host, port, pin, timeout)
+        import pqchannel as _pq
+        pub = _pq.fetch_server_key(host, port)
+        import socket as _s
+        raw = _s.create_connection((host, port), timeout=timeout)
+        s = _pq.client_connect(raw, pub, pin)
     else:
+        import socket
         s = socket.create_connection((host, port), timeout=timeout)
     from net import send_msg, recv_msg
     with s, s.makefile("rwb") as f:
