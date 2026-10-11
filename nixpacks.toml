@@ -1,0 +1,2 @@
+[phases.setup]
+aptPkgs = ["libgomp1", "ca-certificates"]
