@@ -19,6 +19,27 @@ import urllib.request
 
 JUDGE_URL = "http://127.0.0.1:19092/v1/systemone"
 
+# Hosted fallback (Jev API, System-One compatible). Key NEVER in source:
+# export JEV_API_KEY=...  / Railway service variable.
+JEV_URL = "https://jev-api.com/v1/systemone"
+JEV_MODEL = "jev-latest"
+
+
+def _ask_remote(state: str, questions: dict, timeout: float = 60.0) -> dict | None:
+    import os as _os
+    key = _os.environ.get("JEV_API_KEY", "")
+    if not key:
+        return None
+    body = json.dumps({"model": JEV_MODEL, "state": state, "questions": questions}).encode()
+    req = urllib.request.Request(JEV_URL, data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
 
 def _ask(url: str, state: str, questions: dict, timeout: float = 60.0) -> dict | None:
     body = json.dumps({"state": state, "questions": questions}).encode()
@@ -70,14 +91,18 @@ class DJudge:
         self.url, self.timeout = url, timeout
 
     def rate(self, prompt: str, answer: str, reference: str = "") -> dict:
-        """Returns {correct_p, useful_p} in [0,1] (None each if abstaining)."""
+        """Returns {correct_p, useful_p} in [0,1] (None each if abstaining).
+        Local d1 first; hosted Jev API fallback (needs JEV_API_KEY)."""
         ref = f"\nReference (ground truth, may be empty): {reference}" if reference else ""
         state = f"Task: {prompt}\nMiner answer: {answer[:2000]}{ref}"
-        out = _ask(self.url, state, {
+        questions = {
             "correct": {"type": "noul", "instructions": "Is the miner answer correct for the task?"},
             "useful": {"type": "score", "instructions": "How useful is the miner answer?",
                        "criteria": ["useless", "partially useful", "fully useful"]},
-        }, self.timeout)
+        }
+        out = _ask(self.url, state, questions, self.timeout)
+        if out is None:
+            out = _ask_remote(state, questions, self.timeout)
         if not out:
             return {"correct_p": None, "useful_p": None}
         res = out.get("answers", out.get("results", out))
